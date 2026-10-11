@@ -17,6 +17,7 @@ import {
   KUBERNETES_FIELD_HINTS,
   KUBERNETES_FIELD_RULES,
   offersSshTunnel,
+  offersSslPanel,
   readOnlyHint,
   S3_FIELD_HINTS,
   S3_FIELD_RULES,
@@ -84,6 +85,7 @@ const ALL_TYPES: DatabaseType[] = [
   "influxdb3",
   "oxia",
   "databend",
+  "bigquery",
   "s3",
   "kubernetes",
 ];
@@ -298,7 +300,7 @@ describe("db-ui-config", () => {
       expect(offersSshTunnel("postgres")).toBe(true);
     });
 
-    test("only kafka's connections refuse an SSH tunnel, and only because its entry declares it", () => {
+    test("only kafka's and bigquery's connections refuse an SSH tunnel, and only because their entries declare it", () => {
       // Derived from the declaration rather than typed out: a tunnel forwards one address, and a
       // Kafka client reaches every broker at the address the broker advertises (docs/providers/kafka.md).
       for (const type of ALL_TYPES) {
@@ -308,9 +310,20 @@ describe("db-ui-config", () => {
         });
       }
       const refusing = ALL_TYPES.filter((type) => !offersSshTunnel(type));
-      expect(refusing).toEqual(["kafka"]);
+      expect(refusing.sort()).toEqual(["bigquery", "kafka"]);
       // A file-based engine still answers true: its panel is hidden by isFileBased instead.
       expect(offersSshTunnel("sqlite")).toBe(true);
+    });
+
+    test("only bigquery's connections withhold the SSL panel, and only because its entry declares it", () => {
+      // BigQuery always speaks HTTPS to googleapis.com with the system trust store, so an SSL mode is read by nothing.
+      for (const type of ALL_TYPES) {
+        expect({ type, offered: offersSslPanel(type) }).toEqual({
+          type,
+          offered: getDBConfig(type).showSslPanel !== false,
+        });
+      }
+      expect(ALL_TYPES.filter((type) => !offersSslPanel(type))).toEqual(["bigquery"]);
     });
 
     test("a field an engine draws as a select is a field it takes, and the SASL select is drawn exactly where the field is taken", () => {
@@ -657,6 +670,7 @@ const FIELD_CHECKLIST: Record<ConnectionField, true> = {
   allowInsecureAuth: true,
   dataServers: true,
   warehouse: true,
+  location: true,
   region: true,
   apiPath: true,
   namespaces: true,
@@ -939,7 +953,7 @@ describe("declared connection-field copy (#1085)", () => {
     }
   });
 
-  test("only libsql, db2, prometheus, kafka, etcd, neo4j, milvus, qdrant, the two InfluxDB types, oxia, databend, s3 and kubernetes declare field copy, so every other engine draws every label and hint it drew before", () => {
+  test("only libsql, db2, prometheus, kafka, etcd, neo4j, milvus, qdrant, the two InfluxDB types, oxia, databend, bigquery, s3 and kubernetes declare field copy, so every other engine draws every label and hint it drew before", () => {
     const declared = Object.entries(DB_UI_CONFIG)
       .filter(([, config]) => config.fieldLabels !== undefined || config.fieldHints !== undefined)
       .map(([type]) => type);
@@ -956,6 +970,7 @@ describe("declared connection-field copy (#1085)", () => {
       "influxdb3",
       "oxia",
       "databend",
+      "bigquery",
       "s3",
       "kubernetes",
     ]);
@@ -1362,6 +1377,8 @@ describe("db-showcase", () => {
         "kubernetes",
         "libsql",
         "libredb",
+        // Last (rank 28): the newest name on this page, so no existing engine moves.
+        "bigquery",
       ]);
     });
   });

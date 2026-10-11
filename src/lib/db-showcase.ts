@@ -100,6 +100,7 @@ export const SHOWCASE_RANK: Record<DatabaseType, number> = {
   // icon and a slot in the connection picker, so omitting it would make the login page
   // contradict the app (issue #425, step 2).
   libredb: 29,
+  bigquery: 30,
 };
 
 /**

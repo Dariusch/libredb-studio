@@ -741,3 +741,23 @@ export const KubernetesIcon: React.FC<IconProps> = ({ className, ...props }) => 
     <path d="M10.48 12.88 L7.24 14.75" />
   </svg>
 );
+
+/** A magnifier over bars: a mark drawn for Studio, never Google's logo. */
+export const BigQueryIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="10.5" cy="10.5" r="6.5" />
+    <path d="m15.5 15.5 5 5" />
+    <path d="M8 12.5v-1.5" />
+    <path d="M10.5 12.5v-4" />
+    <path d="M13 12.5v-2.5" />
+  </svg>
+);
