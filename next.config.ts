@@ -205,6 +205,9 @@ const basePath = readBasePath(process.env.BASE_PATH);
 
 const nextConfig: NextConfig = {
   basePath,
+  // Dev only: hosts other than localhost that may load /_next dev resources, comma separated (a LAN name or address
+  // such as "devbox.local,192.0.2.10"). Empty by default, which keeps Next's own localhost-only default.
+  allowedDevOrigins: process.env.DEV_ALLOWED_ORIGINS?.split(",") ?? [],
   env: {
     NEXT_PUBLIC_APP_VERSION: packageJson.version,
     NEXT_PUBLIC_BASE_PATH: basePath,
