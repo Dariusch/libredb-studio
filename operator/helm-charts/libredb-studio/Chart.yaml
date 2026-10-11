@@ -1,8 +1,8 @@
 apiVersion: v2
 name: libredb-studio
-description: Web-based SQL IDE for cloud-native teams supporting thirty engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, BigQuery, Apache Cassandra, libSQL, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB, InfluxDB 3, Oxia, Databend, S3-compatible object storage and Kubernetes
+description: Web-based SQL IDE for cloud-native teams supporting thirty-one engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, BigQuery, Apache Cassandra, libSQL, Prometheus, Apache Kafka, MQTT, etcd, Neo4j, Milvus, Qdrant, InfluxDB, InfluxDB 3, Oxia, Databend, S3-compatible object storage and Kubernetes
 type: application
-version: 0.1.86
+version: 0.1.87
 appVersion: "0.18.3"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
@@ -93,6 +93,9 @@ keywords:
   # One keyword, like databend above: `bigquery` is the type-id and the word an evaluator looking for a
   # BigQuery client types.
   - bigquery
+  # One keyword, like kubernetes above: `mqtt` is the type-id and the protocol an evaluator looking
+  # for a broker browser types; no product name to catch, because every broker speaks the same standard.
+  - mqtt
   - web-ide
 maintainers:
   - name: cevheri
@@ -242,7 +245,7 @@ annotations:
   # 50 log lines, and provider fixes. Query history keeps no value of a kubectl credential flag,
   # and the text transport now refuses a method other than GET or POST, which no released
   # caller sent. No template, value or default moves, so the upgrade is the image.
-  # False: 0.1.86 changes chart metadata only, naming BigQuery in the description, the keywords and the
+  # False: 0.1.87 changes chart metadata only, naming BigQuery in the description, the keywords and the
   # README; no template, value or default moves.
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |

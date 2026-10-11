@@ -51,6 +51,7 @@ const OFFERED: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
   // No test data: v1 sends no write.
   s3: false,
   kubernetes: false,
+  mqtt: false,
 });
 
 const TYPES = Object.keys(OFFERED) as DatabaseType[];

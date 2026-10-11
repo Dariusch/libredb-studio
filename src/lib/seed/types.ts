@@ -78,6 +78,7 @@ const SeedDatabaseType = z.enum([
   "bigquery",
   "s3",
   "kubernetes",
+  "mqtt",
 ]);
 
 export const SeedDefaultsSchema = z.object({

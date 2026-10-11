@@ -448,6 +448,7 @@ const GRAMMAR_COVERAGE: Record<DatabaseType, "established" | "default"> = {
   s3: "default",
   // One kubectl statement, not SQL: no SQL grammar is established for it, and none is read.
   kubernetes: "default",
+  mqtt: "default",
 };
 
 /**
@@ -702,6 +703,7 @@ const SQL_TEXT_COVERAGE: Record<DatabaseType, boolean> = {
   s3: false,
   // A kubectl statement is words split by POSIX shell rules, not SQL text.
   kubernetes: false,
+  mqtt: false,
 };
 
 describe("readsSqlText", () => {

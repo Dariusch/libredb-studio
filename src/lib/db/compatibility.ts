@@ -107,6 +107,11 @@ const SHIPPED: Readonly<Record<DatabaseType, true>> = Object.freeze({
   // Kubernetes: its own provider, doc and integration test, the first member of the `platform/` family: a cluster read
   // over the API server's REST API, beside the databases rather than one of them.
   kubernetes: true,
+  // MQTT (#1635): its own provider, doc and integration test. A broker rather than a store, and the first
+  // engine here whose read cannot be proved complete, which the provider states on every read rather than
+  // hiding. No relative is recorded: every broker speaks the same standard, and a standard is not a
+  // compatibility claim about a product.
+  mqtt: true,
   libredb: true,
 });
 
@@ -180,6 +185,7 @@ const EXTERNAL: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
   s3: true,
   // A cluster the user already runs, reached over the Kubernetes API server's REST API.
   kubernetes: true,
+  mqtt: true,
   // The one false entry. SQLite is a file rather than a server and is still
   // external: it is the user's file, opened from a path they give us. libredb is
   // ours, created by this app, so it is the only id that answers no here.
@@ -271,6 +277,9 @@ export const READ_ONLY_ENFORCED: Record<DatabaseType, boolean> = Object.freeze({
   // Read-only whatever the flag says: the request policy admits GET and the three self reviews only, before any
   // socket, and the provider offers no object edit and no maintenance operation.
   kubernetes: true,
+  // Structural rather than a mode: the encoder has no function that writes a PUBLISH, so there is no
+  // write to enforce against. The valve repeats the check on the bytes.
+  mqtt: true,
   libredb: false,
 });
 
@@ -325,6 +334,7 @@ export const READS_FILE_ACCESS_POSTURE: Readonly<Record<DatabaseType, boolean>> 
   databend: false,
   s3: false,
   kubernetes: false,
+  mqtt: false,
   libredb: false,
 });
 
@@ -386,6 +396,9 @@ export const MCP_EXPOSABLE: Readonly<Record<DatabaseType, boolean>> = Object.fre
   // Outside this version, as etcd's and Oxia's: the provider implements no read-only query path, and plan mode alone
   // receives Kubernetes object names, Secret and Namespace names withheld (no MCP surface is designed for them yet).
   kubernetes: false,
+  // Outside this version, as for etcd, Oxia and S3: a read whose completeness cannot be proved is not a
+  // read an agent should be handed without a reader looking at it.
+  mqtt: false,
   libredb: true,
 });
 
@@ -431,6 +444,7 @@ export const CONNECTION_FORM_URI_MODE: Readonly<Record<DatabaseType, boolean>> =
   databend: false,
   s3: false,
   kubernetes: false,
+  mqtt: false,
   libredb: false,
 });
 
@@ -482,6 +496,7 @@ export const CONNECTION_STRING_ACCEPTED: Readonly<Record<DatabaseType, boolean>>
   databend: false,
   s3: false,
   kubernetes: false,
+  mqtt: false,
   libredb: false,
 });
 
