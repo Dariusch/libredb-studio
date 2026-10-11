@@ -483,8 +483,8 @@ describe("query", () => {
       placed_at: "TIMESTAMP",
       ship: "STRUCT<city STRING, zip INT64>",
       tags: "ARRAY<STRING>",
-      total: "FLOAT",
-      paid: "BOOLEAN",
+      total: "FLOAT64",
+      paid: "BOOL",
     });
     expect(result.warnings).toEqual([{ message: "Processed 2 MB, billed 10 MB", severity: "info" }]);
   });
@@ -596,7 +596,7 @@ describe("object surface", () => {
     // One catalog read of each view serves every listing, count and bulk column read.
     expect(queriesWith(/INFORMATION_SCHEMA\.TABLES/)).toHaveLength(1);
     expect(queriesWith(/INFORMATION_SCHEMA\.COLUMNS/)).toHaveLength(1);
-    expect(queriesWith(/INFORMATION_SCHEMA\.TABLES/)[0].body).toMatchObject({ jobTimeoutMs: expect.any(Number) });
+    expect(queriesWith(/INFORMATION_SCHEMA\.TABLES/)[0].body).toMatchObject({ jobTimeoutMs: expect.any(String) });
     expect(String(queriesWith(/INFORMATION_SCHEMA\.TABLES/)[0].body?.query)).toContain(
       "`demo-project`.`region-eu`.INFORMATION_SCHEMA.TABLES",
     );

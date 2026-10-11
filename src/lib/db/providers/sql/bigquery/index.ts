@@ -129,7 +129,7 @@ export function jobLocation(datasets: readonly BigQueryDatasetRef[], defaultData
   const own = datasets.find((d) => d.id === defaultDataset)?.location;
   if (own) return own;
   const counts = new Map<string, number>();
-  for (const d of datasets) counts.set(d.location, (counts.get(d.location) ?? 0) + 1);
+  for (const d of datasets) if (d.location) counts.set(d.location, (counts.get(d.location) ?? 0) + 1);
   return [...counts].sort((a, b) => b[1] - a[1])[0]?.[0];
 }
 
@@ -143,11 +143,14 @@ function raceSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/** `tables.get` uses legacy type names; INFORMATION_SCHEMA uses these. */
+const LEGACY_TYPES: Readonly<Record<string, string>> = { INTEGER: "INT64", FLOAT: "FLOAT64", BOOLEAN: "BOOL" };
+
 function columnType(field: BigQueryField): string {
   const base =
     field.fields && field.fields.length > 0
       ? `STRUCT<${field.fields.map((f) => `${f.name} ${columnType(f)}`).join(", ")}>`
-      : field.type;
+      : (LEGACY_TYPES[field.type] ?? field.type);
   return field.mode === "REPEATED" ? `ARRAY<${base}>` : base;
 }
 
@@ -380,7 +383,7 @@ export class BigQueryProvider extends SQLBaseProvider {
       return result.rows;
     };
 
-    const locations = [...new Set(datasets.map((d) => d.location.toLowerCase()))];
+    const locations = [...new Set(datasets.flatMap((d) => (d.location ? [d.location.toLowerCase()] : [])))];
     const outcomes = await Promise.all(
       locations.map(async (location) => {
         const schema = `${project}.${this.escapeIdentifier(`region-${location}`)}.INFORMATION_SCHEMA`;
@@ -392,7 +395,7 @@ export class BigQueryProvider extends SQLBaseProvider {
                 "ORDER BY table_schema, table_name, ordinal_position",
             ),
           ]);
-          for (const d of datasets) if (d.location.toLowerCase() === location) tables.set(d.id, []);
+          for (const d of datasets) if (d.location?.toLowerCase() === location) tables.set(d.id, []);
           for (const row of tableRows) {
             const dataset = String(row.table_schema);
             const list = tables.get(dataset) ?? [];

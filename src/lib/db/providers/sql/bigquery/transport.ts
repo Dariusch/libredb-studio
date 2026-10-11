@@ -44,7 +44,8 @@ export interface BigQueryTableRef {
 
 export interface BigQueryDatasetRef {
   readonly id: string;
-  readonly location: string;
+  /** The emulator lists none. */
+  readonly location?: string;
 }
 
 export interface BigQueryTable {
@@ -137,7 +138,24 @@ function decodeRows(fields: readonly BigQueryField[], rows: unknown): Record<str
   });
 }
 
-export function createBigQueryTransport(project: string, creds: GoogleCredentials): BigQueryTransport {
+/** Env only, never a connection field: a user must not point a connection's token at another host. */
+export function apiOrigin(env: Readonly<Record<string, string | undefined>> = process.env): {
+  scheme: "http" | "https";
+  host: string;
+  port: number;
+} {
+  const emulator = env.BIGQUERY_EMULATOR_HOST?.trim();
+  if (!emulator) return { scheme: "https", host: API_HOST, port: 443 };
+  const url = new URL(emulator.includes("://") ? emulator : `http://${emulator}`);
+  const scheme = url.protocol === "https:" ? "https" : "http";
+  return { scheme, host: url.hostname, port: url.port ? Number(url.port) : scheme === "https" ? 443 : 80 };
+}
+
+export function createBigQueryTransport(
+  project: string,
+  creds: GoogleCredentials,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): BigQueryTransport {
   // encodeURIComponent keeps "." and "..", which would climb out of /projects/ in the URL path.
   if (!/^[a-z][a-z0-9:.-]{0,200}$/i.test(project) || project === "." || project === "..") {
     throw new DatabaseConfigError("BigQuery project id is not a valid project id", "bigquery");
@@ -152,7 +170,8 @@ export function createBigQueryTransport(project: string, creds: GoogleCredential
     headers: creds.type === "metadata" ? { "metadata-flavor": "Google" } : {},
   });
   const token = createTokenSource(creds, oauth);
-  const base = `https://${API_HOST}/bigquery/v2/projects/${encodeURIComponent(project)}`;
+  const api = apiOrigin(env);
+  const base = `${new URL(`${api.scheme}://${api.host}:${api.port}`).origin}/bigquery/v2/projects/${encodeURIComponent(project)}`;
 
   // The node transport owns Authorization as a connection header, so each token gets its own transport.
   // A replaced one closes once its in-flight requests finish, since close() aborts them.
@@ -162,8 +181,8 @@ export function createBigQueryTransport(project: string, creds: GoogleCredential
   let closed = false;
   const laneTransport = (bearer: string) =>
     createNodeTransport({
-      origin: { scheme: "https", host: API_HOST, port: 443 },
-      tls: tls(API_HOST),
+      origin: api,
+      tls: api.scheme === "https" ? tls(api.host) : null,
       maxSockets: 8,
       headers: { authorization: `Bearer ${bearer}` },
     });
@@ -257,7 +276,8 @@ export function createBigQueryTransport(project: string, creds: GoogleCredential
           dryRun: options.dryRun ?? false,
           maxResults: Math.min(options.maxRows, PAGE_ROWS),
           timeoutMs: options.jobTimeoutMs,
-          jobTimeoutMs: options.jobTimeoutMs,
+          // int64 is a JSON string in the REST schema; the emulator refuses a number.
+          jobTimeoutMs: String(options.jobTimeoutMs),
           formatOptions: { useInt64Timestamp: true },
           ...(options.defaultDataset
             ? { defaultDataset: { projectId: project, datasetId: options.defaultDataset } }
@@ -314,7 +334,8 @@ export function createBigQueryTransport(project: string, creds: GoogleCredential
         const page = await call("GET", `/datasets?${params}`, signal);
         for (const d of listed(page.datasets)) {
           const id = (d?.datasetReference as Wire | undefined)?.datasetId;
-          if (typeof id === "string" && typeof d?.location === "string") ids.push({ id, location: d.location });
+          if (typeof id !== "string") continue;
+          ids.push({ id, ...(typeof d?.location === "string" ? { location: d.location } : {}) });
         }
         pageToken = typeof page.nextPageToken === "string" ? page.nextPageToken : undefined;
       } while (pageToken);

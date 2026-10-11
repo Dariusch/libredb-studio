@@ -52,4 +52,9 @@ describe("bigquery jobLocation", () => {
     expect(jobLocation(datasets)).toBe("EU");
     expect(jobLocation([])).toBeUndefined();
   });
+
+  test("a dataset listed with no location counts for none", () => {
+    expect(jobLocation([{ id: "x" }, { id: "y" }, { id: "c", location: "US" }], "x")).toBe("US");
+    expect(jobLocation([{ id: "x" }])).toBeUndefined();
+  });
 });

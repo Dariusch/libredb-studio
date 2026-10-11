@@ -161,7 +161,7 @@ The location comes from, in order:
 
 1. the connection's `location` field, when set;
 2. otherwise, at connect, the default dataset's location, when `schema` is set;
-3. otherwise the location most of the project's datasets share.
+3. otherwise the location most of the project's datasets share (a dataset listed without a location counts for none).
 
 A principal that may not list datasets still connects: the location is then left to BigQuery, which infers it from the referenced tables (an authentication failure still fails the connect).
 Every job is sent with the location when there is one.
@@ -202,6 +202,8 @@ Tables, views and their columns come from two region-level `INFORMATION_SCHEMA` 
 On a project with 3014 objects this took the inventory from 78 s (one `tables.get` per table) to under 10 s.
 
 If a region's views are refused, or a region holds more than 2 million columns, the provider falls back to REST for that region's datasets only: `tables.list` per dataset (cached 30 s) and `tables.get` per table, at most 8 at a time, where a table that cannot be read loses its columns instead of failing the inventory.
+`tables.get` reports the legacy type names (`INTEGER`, `FLOAT`, `BOOLEAN`), which the provider renames to the GoogleSQL ones `INFORMATION_SCHEMA` uses (`INT64`, `FLOAT64`, `BOOL`), so both paths describe a column alike.
+A dataset that `datasets.list` names without a location is still listed; its tables come from REST.
 A catalog where every region failed is cached for 60 s (a good one for 5 minutes), so a principal without `INFORMATION_SCHEMA` access does not re-read every region on each tree expansion.
 A shared table listing or catalog read runs on its own deadline, and each caller waits on it with its own, so one caller's cancel does not fail another.
 A DDL statement run through the editor (`CREATE`, `DROP`, `ALTER`) drops the cached catalog and table lists, as does a disconnect, so a new table shows up at the next refresh.
@@ -253,5 +255,19 @@ Uptime, connections and indexes have no BigQuery counterpart and stay empty.
 | `tests/unit/db/bigquery/token-source.test.ts`    | Token minting, caching and single-flight refresh                                                                                     |
 | `tests/unit/sql-completions.test.ts`             | Qualified table labels                                                                                                               |
 | `tests/unit/sql/bigquery-grammar.test.ts`        | The BigQuery statement grammar: triple quotes, `#` comments, escapes, subscripts                                                     |
+| `tests/live/bigquery-live-check.ts`              | Hand-run, against goccy/bigquery-emulator; not in `bun run test` (see below)                                                         |
 
-There is no integration test against a live project yet; BigQuery has no local emulator that implements `jobs.query` and `INFORMATION_SCHEMA` faithfully.
+### 9.1 Live check against the emulator
+
+[goccy/bigquery-emulator](https://github.com/goccy/bigquery-emulator) answers the REST API locally, and the server sends every API request to it when `BIGQUERY_EMULATOR_HOST` (`host:port`, plain HTTP) is set in the server's environment; it is never a connection field.
+`tests/live/bigquery-live-check.ts` runs the real provider and transport against it and exits non-zero on any failure:
+
+```bash
+docker run --rm -p 127.0.0.1:9050:9050 ghcr.io/goccy/bigquery-emulator:0.8.1 --project=demo-project --dataset=libredb_live
+BIGQUERY_EMULATOR_HOST=127.0.0.1:9050 bun tests/live/bigquery-live-check.ts
+```
+
+It covers connect, `datasets.list`, `tables.list` and `tables.get` (tables, views and their columns), typed cells, a 12,000-row result, and a query across two pages: `jobs.query`, then `getQueryResults` with the page token.
+The emulator's `jobs.query` answers every row and no `pageToken` (it ignores `maxResults`, `server/handler.go` at v0.8.1), so for the paging check the script puts a pass-through proxy in front of it that cuts the first answer at `maxResults` as BigQuery does; every later page is the emulator's own `getQueryResults` answer.
+
+It does not cover, so these stay covered by the fake REST server only: dry runs and bytes processed (the emulator runs a `dryRun` query and reports no bytes), region-level `INFORMATION_SCHEMA` (refused, so the catalog comes from the REST fallback there), monitoring, job cancel, locations, and authentication (any bearer token is accepted).

@@ -26,7 +26,7 @@ mock.module("@/lib/db/http/node-transport", () => ({
           entry.fail.push(reject);
           req.signal?.addEventListener("abort", () => reject(new TransportError("aborted", "cancelled")));
           Promise.resolve(
-            req.url.includes("bigquery.googleapis.com")
+            new URL(req.url).pathname.startsWith("/bigquery/v2/")
               ? api(req)
               : { status: 200, text: JSON.stringify({ access_token: `t${++tokenCount}`, expires_in: tokenTtl }) },
           ).then(resolve, reject);
@@ -41,7 +41,7 @@ mock.module("@/lib/db/http/node-transport", () => ({
   },
 }));
 
-const { BigQueryApiError, createBigQueryTransport, decodeCell } = await import(
+const { BigQueryApiError, apiOrigin, createBigQueryTransport, decodeCell } = await import(
   "@/lib/db/providers/sql/bigquery/transport"
 );
 
@@ -72,6 +72,41 @@ describe("bigquery transport wiring", () => {
       tls: null,
       headers: { "metadata-flavor": "Google" },
     });
+  });
+});
+
+describe("BIGQUERY_EMULATOR_HOST", () => {
+  test("unset or blank, the API is Google's over https", () => {
+    for (const env of [{}, { BIGQUERY_EMULATOR_HOST: "  " }]) {
+      expect(apiOrigin(env)).toEqual({ scheme: "https", host: "bigquery.googleapis.com", port: 443 });
+    }
+  });
+
+  test("host:port is plain http, and a URL keeps its scheme and default port", () => {
+    expect(apiOrigin({ BIGQUERY_EMULATOR_HOST: "localhost:9050" })).toEqual({
+      scheme: "http",
+      host: "localhost",
+      port: 9050,
+    });
+    expect(apiOrigin({ BIGQUERY_EMULATOR_HOST: "emulator" })).toEqual({ scheme: "http", host: "emulator", port: 80 });
+    expect(apiOrigin({ BIGQUERY_EMULATOR_HOST: "https://bq.test" })).toEqual({
+      scheme: "https",
+      host: "bq.test",
+      port: 443,
+    });
+  });
+
+  test("routes every API request to the emulator without TLS", async () => {
+    api = () => json({ datasets: [] });
+    const bq = createBigQueryTransport(
+      "p",
+      { type: "access_token", token: "t" },
+      { BIGQUERY_EMULATOR_HOST: "127.0.0.1:9050" },
+    );
+    await bq.listDatasets(signal);
+    const lane = built.find((b) => b.opts.origin.port === 9050);
+    expect(lane?.opts).toMatchObject({ origin: { scheme: "http", host: "127.0.0.1", port: 9050 }, tls: null });
+    expect(lane?.requests[0].url).toStartWith("http://127.0.0.1:9050/bigquery/v2/projects/p/datasets?");
   });
 });
 
@@ -112,7 +147,7 @@ describe("bigquery query", () => {
       dryRun: true,
       maxResults: 100,
       timeoutMs: 1000,
-      jobTimeoutMs: 1000,
+      jobTimeoutMs: "1000",
       formatOptions: { useInt64Timestamp: true },
       defaultDataset: { projectId: "my-proj", datasetId: "ds" },
     });
@@ -455,7 +490,7 @@ describe("bigquery malformed wire answers", () => {
         nextPageToken: 7,
       });
     const bq = createBigQueryTransport("p", creds);
-    expect(await bq.listDatasets(signal)).toEqual([{ id: "a", location: "US" }]);
+    expect(await bq.listDatasets(signal)).toEqual([{ id: "x" }, { id: "a", location: "US" }]);
     api = () =>
       json({
         tables: [
