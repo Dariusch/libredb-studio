@@ -107,7 +107,7 @@ connections:
   - id: "bq-integration"
     name: "BigQuery integration"
     type: "bigquery"
-    database: "rmt-integration"          # project id
+    database: "acme-integration"         # project id
     schema: "analytics"                  # optional default dataset
     location: "EU"                       # optional; detected when absent
     password: "${BQ_INTEGRATION_SA_JSON}"
@@ -118,7 +118,7 @@ connections:
   - id: "bq-production"
     name: "BigQuery production"
     type: "bigquery"
-    database: "rmt-production"
+    database: "acme-production"
     roles: ["admin"]
     managed: true
 ```
@@ -214,7 +214,7 @@ The shared inventory route reads at most 1000 container/kind pairs; with three k
 
 ### 7.1 Autocomplete
 
-Completion is shared by every SQL engine; BigQuery adds one behaviour:
+Completion is shared by every SQL engine ([SQL completion](../editor/sql-alias-completion.md)); BigQuery adds one behaviour:
 
 - A table suggestion outside the default dataset is labelled and inserted as `dataset.table`, so one name held by many datasets reads as many tables. With no default dataset, every table is still inserted qualified, because the provider declares `tablesNeedContainer`: a bare table name is an error in BigQuery.
 
