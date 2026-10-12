@@ -245,17 +245,18 @@ Uptime, connections and indexes have no BigQuery counterpart and stay empty.
 
 ## 9. Tests
 
-| Test                                             | Covers                                                                                                                               |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `tests/unit/db/bigquery/decode.test.ts`          | Cell decoding, the dry-run strategy, job location selection                                                                          |
-| `tests/integration/db/bigquery-provider.test.ts` | The provider, transport and auth end to end over a fake REST server: connect, query, object surface (shared conformance), monitoring |
-| `tests/unit/db/bigquery/provider.test.ts`        | The provider over a fake transport                                                                                                   |
-| `tests/unit/db/bigquery/transport.test.ts`       | The REST envelope: `jobs.query`, the dry run, paging, job cancel, token lanes                                                        |
-| `tests/unit/db/bigquery/credentials.test.ts`     | Credential resolution order and the server-credentials opt-in                                                                        |
-| `tests/unit/db/bigquery/token-source.test.ts`    | Token minting, caching and single-flight refresh                                                                                     |
-| `tests/unit/sql-completions.test.ts`             | Qualified table labels                                                                                                               |
-| `tests/unit/sql/bigquery-grammar.test.ts`        | The BigQuery statement grammar: triple quotes, `#` comments, escapes, subscripts                                                     |
-| `tests/live/bigquery-live-check.ts`              | Hand-run, against goccy/bigquery-emulator; not in `bun run test` (see below)                                                         |
+| Test                                             | Covers                                                                                                                                                                          |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tests/unit/db/bigquery/decode.test.ts`          | Cell decoding, the dry-run strategy, job location selection                                                                                                                     |
+| `tests/integration/db/bigquery-provider.test.ts` | The provider, transport and auth end to end, replaying the live captures of `tests/fixtures/bigquery/`: connect, query, object surface (shared conformance), monitoring         |
+| `tests/unit/db/bigquery/provider.test.ts`        | The provider over a fake transport                                                                                                                                              |
+| `tests/unit/db/bigquery/transport.test.ts`       | The REST envelope: `jobs.query`, the dry run, paging, job cancel, token lanes                                                                                                   |
+| `tests/unit/db/bigquery/credentials.test.ts`     | Credential resolution order and the server-credentials opt-in                                                                                                                   |
+| `tests/unit/db/bigquery/token-source.test.ts`    | Token minting, caching and single-flight refresh                                                                                                                                |
+| `tests/unit/sql-completions.test.ts`             | Qualified table labels                                                                                                                                                          |
+| `tests/unit/sql/bigquery-grammar.test.ts`        | The BigQuery statement grammar: triple quotes, `#` comments, escapes, subscripts                                                                                                |
+| `tests/live/bigquery-live-check.ts`              | Hand-run, against goccy/bigquery-emulator; not in `bun run test` (see below)                                                                                                    |
+| `tests/live/bigquery-evidence.ts`                | Hand-run, against a live project; records and scrubs the captures the integration test replays ([`tests/fixtures/bigquery/README.md`](../../tests/fixtures/bigquery/README.md)) |
 
 ### 9.1 Live check against the emulator
 
@@ -271,4 +272,4 @@ BIGQUERY_EMULATOR_HOST=127.0.0.1:9050 bun tests/live/bigquery-live-check.ts
 It covers connect, `datasets.list`, `tables.list` and `tables.get` (tables, views and their columns), typed cells, a 12,000-row result, and a query across two pages: `jobs.query`, then `getQueryResults` with the page token.
 The emulator's `jobs.query` answers every row and no `pageToken` (it ignores `maxResults`, `server/handler.go` at v0.8.1), so for the paging check the script puts a pass-through proxy in front of it that cuts the first answer at `maxResults` as BigQuery does; every later page is the emulator's own `getQueryResults` answer.
 
-It does not cover, so these stay covered by the fake REST server only: dry runs and bytes processed (the emulator runs a `dryRun` query and reports no bytes), region-level `INFORMATION_SCHEMA` (refused, so the catalog comes from the REST fallback there), monitoring, job cancel, locations, and authentication (the emulator checks none, so none is sent).
+It does not cover, so these stay covered by the replayed captures only: dry runs and bytes processed (the emulator runs a `dryRun` query and reports no bytes), region-level `INFORMATION_SCHEMA` (refused, so the catalog comes from the REST fallback there), monitoring, job cancel, locations, and authentication (the emulator checks none, so none is sent).
