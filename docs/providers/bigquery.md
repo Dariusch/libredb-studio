@@ -260,6 +260,7 @@ Uptime, connections and indexes have no BigQuery counterpart and stay empty.
 ### 9.1 Live check against the emulator
 
 [goccy/bigquery-emulator](https://github.com/goccy/bigquery-emulator) answers the REST API locally, and the server sends every API request to it when `BIGQUERY_EMULATOR_HOST` (`host:port`, plain HTTP) is set in the server's environment; it is never a connection field.
+While it is set the server mints no token and sends no `authorization` header, whatever credential the connection holds; the password field is still required and still parsed, so put a placeholder access token (20 or more URL-safe characters) or a key JSON there; neither is sent.
 `tests/live/bigquery-live-check.ts` runs the real provider and transport against it and exits non-zero on any failure:
 
 ```bash
@@ -270,4 +271,4 @@ BIGQUERY_EMULATOR_HOST=127.0.0.1:9050 bun tests/live/bigquery-live-check.ts
 It covers connect, `datasets.list`, `tables.list` and `tables.get` (tables, views and their columns), typed cells, a 12,000-row result, and a query across two pages: `jobs.query`, then `getQueryResults` with the page token.
 The emulator's `jobs.query` answers every row and no `pageToken` (it ignores `maxResults`, `server/handler.go` at v0.8.1), so for the paging check the script puts a pass-through proxy in front of it that cuts the first answer at `maxResults` as BigQuery does; every later page is the emulator's own `getQueryResults` answer.
 
-It does not cover, so these stay covered by the fake REST server only: dry runs and bytes processed (the emulator runs a `dryRun` query and reports no bytes), region-level `INFORMATION_SCHEMA` (refused, so the catalog comes from the REST fallback there), monitoring, job cancel, locations, and authentication (any bearer token is accepted).
+It does not cover, so these stay covered by the fake REST server only: dry runs and bytes processed (the emulator runs a `dryRun` query and reports no bytes), region-level `INFORMATION_SCHEMA` (refused, so the catalog comes from the REST fallback there), monitoring, job cancel, locations, and authentication (the emulator checks none, so none is sent).
