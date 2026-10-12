@@ -536,7 +536,7 @@ export function offersCodeGeneration(capabilities: ProviderCapabilities | undefi
  * PromQL counts series at an instant, which is not the row count this action promises.
  *
  * A declared dialect is offered it only where its record's `offersCountQuery` in `QUERY_DIALECTS`
- * (`src/lib/db/query-dialects.ts`) says so, which none does, and a declared dialect with no record is refused.
+ * (`src/lib/db/query-dialects.ts`) says so, which Firestore's alone does, and a declared dialect with no record is refused.
  *
  * A derived grouping is refused on top of the language, because a Redis `user:*` row is a
  * summary this server built and there is no object to address (#427).
@@ -609,7 +609,8 @@ export type ExplainFormat =
   | "trino-json"
   | "duckdb-json"
   | "databend-text"
-  | "bigquery-dryrun";
+  | "bigquery-dryrun"
+  | "firestore-explain";
 
 /**
  * How deep an engine's container chain is, in the TYPE rather than only in a derivation.
@@ -960,12 +961,26 @@ export interface ProviderCapabilities {
    * `"kubectl"` is the Kubernetes provider's: one statement of a read-only kubectl subset per run. It landed through one
    * record in each registry and no arm anywhere else.
    *
+   * `"firestore"` is the Firestore provider's: one statement of a read-only subset of the Admin SDK's query chain per
+   * run, `db.collection(...)` and the rest of its chain.
+   *
    * Those arms are now records: a member added here does not compile until it has one in each of
    * `QUERY_DIALECTS` (`src/lib/db/query-dialects.ts`), `DIALECT_EDITORS` (`src/lib/editor/dialect-editors.ts`)
    * and `DIALECT_GENERATORS` (`src/lib/query-generators.ts`), and every other reader of this field and of
    * `queryLanguage` is held to a closed list by `tests/unit/lib/dialect-reader-allowlist.test.ts`.
    */
-  queryDialect?: "libredb" | "redis" | "kafka" | "etcd" | "milvus" | "qdrant" | "oxia" | "s3" | "mqtt" | "kubectl";
+  queryDialect?:
+    | "libredb"
+    | "redis"
+    | "kafka"
+    | "etcd"
+    | "milvus"
+    | "qdrant"
+    | "oxia"
+    | "s3"
+    | "mqtt"
+    | "firestore"
+    | "kubectl";
   supportsExplain: boolean;
   /**
    * Present iff supportsExplain is true (enforced by provider tests).
@@ -3113,6 +3128,36 @@ export type ObjectSourcePart =
       readonly label: string;
       /** The engine's own sentence, unprefixed, never a rewrite of it. */
       readonly unavailable: string;
+    }
+  /**
+   * A neutral statement about the object, never a failure: "this engine cannot show X without
+   * changing it, so nothing is read here". The viewer draws the sentence as plain text, without the
+   * "could not be read" heading the refusal arm gets.
+   *
+   * A SUPERSET of the refusal arm, and that is the point of its shape: `unavailable` carries the
+   * statement's sentence and `statement: true` marks it neutral. Every reader that narrows with
+   * `isSourcePartUnavailable` still lands it on the refusal arm, so the route's rules for a refusal
+   * hold for it unchanged: never truncated, never an `edit`, never a `text` beside it.
+   * `isSourcePartStatement` is the narrowing that tells the two apart, and it accepts `true` only.
+   *
+   * The compiler does NOT keep `statement` off the readable arm: a union admits a property any of
+   * its members declares, so `{ text, ..., statement: true }` type-checks. Run time closes it, as it
+   * closes the text-plus-refusal hybrid: the client's shape check and `assertObjectSurface` refuse a
+   * `statement` key on a part without `unavailable`, and the client then refuses the whole document.
+   *
+   * ADDITIVE ON PURPOSE, for the reason `KindCount` is: this type is published through
+   * `src/exports/types.ts`, so the two existing members stay valid unchanged. The cost is not the
+   * same as `KindCount`'s, and saying so is what a host needs: a consumer that has not heard of
+   * `statement` narrows this member to the refusal arm and shows a neutral fact under "This
+   * definition could not be read", a mislabelled fact where an unknown count state degrades only to
+   * an imprecise number.
+   */
+  | {
+      readonly id: string;
+      readonly label: string;
+      /** The statement itself: a neutral fact about the object, never a failure. */
+      readonly unavailable: string;
+      readonly statement: true;
     };
 
 /**

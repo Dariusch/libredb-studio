@@ -69,7 +69,7 @@ export async function resolveConnection(
       });
       throw new SeedConnectionError(CUSTOM_CONNECTIONS_DISABLED_MESSAGE, 403, ApiErrorCode.CUSTOM_CONNECTIONS_DISABLED);
     }
-    // BigQuery reads `managed` to lift the billed-bytes cap and allow server credentials.
+    // `managed` is the operator's grant: BigQuery reads it to lift the billed-bytes cap and use server credentials, Firestore to use server credentials.
     return { ...connection, managed: false };
   }
 
