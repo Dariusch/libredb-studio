@@ -230,7 +230,10 @@ The absence is `bigquery`'s entry in `EXPECTED_EDIT_ABSTAINERS` (`tests/helpers/
 
 ## 8. Monitoring
 
-The monitoring panels read the region `INFORMATION_SCHEMA` views for the detected location, cached for 60 s because the panel polls every 30 s and every read bills the 10 MB minimum; a failed read is not cached, so the next poll retries.
+The monitoring panels read the region `INFORMATION_SCHEMA` views for the detected location; a failed read is not cached, so the next poll retries.
+`JOBS_BY_PROJECT` reads are cached for 60 s, because the panel polls every 30 s and every read bills the 10 MB minimum.
+`TABLE_STORAGE` reads are cached for 15 minutes: a project-wide read scans the whole view, which a dry run estimated at about 1.2 GB in a project with many datasets, while a read filtered to one dataset estimated about 100 MB.
+The overview and the storage panel share one read, grouped by dataset.
 
 | Panel           | Source                       | Notes                                                                   |
 | --------------- | ---------------------------- | ----------------------------------------------------------------------- |
@@ -239,7 +242,7 @@ The monitoring panels read the region `INFORMATION_SCHEMA` views for the detecte
 | Slow queries    | `JOBS_BY_PROJECT`, last 24 h | Grouped by query text, ordered by total run time; `rows` is always 0    |
 | Active sessions | `JOBS_BY_PROJECT`            | Jobs not yet `DONE`; the job id is the session id                       |
 | Tables          | `TABLE_STORAGE`              | Rows and logical bytes, the largest 500                                 |
-| Storage         | `TABLE_STORAGE`              | Logical bytes per dataset                                               |
+| Storage         | `TABLE_STORAGE`              | Logical bytes per dataset, from the overview's read                     |
 
 Uptime, connections and indexes have no BigQuery counterpart and stay empty.
 

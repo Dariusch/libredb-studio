@@ -30,4 +30,4 @@ A scrubbed file that still names the project, the organisation, a token, a key f
 | `slow-job`                      | A job still running after `jobs.query`, its poll, its `JOBS_BY_PROJECT` row, and its `jobs.cancel` answer  |
 | `monitoring`                    | The `JOBS_BY_PROJECT` reads of the performance and slow-query panels                                       |
 
-Not captured, so built in the test from the documented shapes: the token endpoint's answers, the 403 refusals, and the three `TABLE_STORAGE` reads, whose dry run estimated about 1.2 GB each in the capture project.
+Not captured, so built in the test from the documented shapes: the token endpoint's answers, the 403 refusals, and the `TABLE_STORAGE` reads, whose project-wide dry run estimated about 1.2 GB in the capture project.

@@ -169,7 +169,6 @@ class FakeGoogle {
     if (/COUNTIF\(cache_hit\)/.test(sql)) return captured("monitoring", 0);
     if (/GROUP BY query/.test(sql)) return captured("monitoring", 1);
     if (/state != 'DONE'/.test(sql)) return captured("slow-job", 2);
-    if (/COUNT\(\*\) AS tables/.test(sql)) return storage(["tables", "bytes"], [["5", "3145728"]]);
     if (/total_rows, total_logical_bytes/.test(sql)) {
       return storage(
         ["table_schema", "table_name", "total_rows", "total_logical_bytes"],
@@ -179,14 +178,15 @@ class FakeGoogle {
         ],
       );
     }
-    if (/GROUP BY table_schema/.test(sql))
+    if (/GROUP BY table_schema/.test(sql)) {
       return storage(
-        ["table_schema", "bytes"],
+        ["table_schema", "tables", "bytes"],
         [
-          ["shop", "3145728"],
-          ["archive", "1024"],
+          ["shop", "4", "3145728"],
+          ["archive", "1", "1024"],
         ],
       );
+    }
     return apiError(400, `unexpected INFORMATION_SCHEMA read: ${sql}`, "invalidQuery");
   }
 }
@@ -530,7 +530,7 @@ describe("monitoring", () => {
       version: "BigQuery (EU)",
       tableCount: 5,
       databaseSize: "3 MB",
-      databaseSizeBytes: 3145728,
+      databaseSizeBytes: 3146752,
       indexCount: 0,
     });
     expect(await provider.getPerformanceMetrics()).toEqual({ cacheHitRatio: 10.5, queriesPerSecond: 0.01 });
