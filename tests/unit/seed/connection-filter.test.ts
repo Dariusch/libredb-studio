@@ -185,6 +185,14 @@ describe("filterByRoles: engine-specific fields", () => {
     expect(none.dataServers).toBeUndefined();
   });
 
+  it("a seed's maxBytesBilled is copied onto the managed connection", () => {
+    const [result] = filterByRoles([{ ...baseConn, type: "bigquery", maxBytesBilled: 20_971_520 }], ["user"]);
+    const [none] = filterByRoles([{ ...baseConn }], ["user"]);
+
+    expect(result.maxBytesBilled).toBe(20_971_520);
+    expect(none.maxBytesBilled).toBeUndefined();
+  });
+
   it("a seed's warehouse is copied onto the managed connection", () => {
     const result = filterByRoles([{ ...baseConn, type: "databend", warehouse: "small-xy2t" }], ["user"]);
     const [none] = filterByRoles([{ ...baseConn }], ["user"]);

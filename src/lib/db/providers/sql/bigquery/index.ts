@@ -7,8 +7,16 @@
  */
 
 import { BIGQUERY_DRY_RUN_MARKER } from "@/lib/explain/bigquery-dryrun";
-import { AuthenticationError, DatabaseConfigError, QueryError, TimeoutError } from "@/lib/db/errors";
+import {
+  AuthenticationError,
+  DatabaseConfigError,
+  ExecutionProfileError,
+  QueryError,
+  TimeoutError,
+} from "@/lib/db/errors";
 import { TransportError } from "@/lib/db/http/node-transport";
+import { inspectAgentStatement } from "@/lib/db/operations/statement-guard";
+import { resolveSqlGrammar } from "@/lib/sql/grammar";
 import {
   assertContainerPathShape,
   assertObjectPathShape,
@@ -19,6 +27,7 @@ import {
 import { comparePaths } from "@/lib/db/object-path";
 import { formatBytes } from "@/lib/db/utils/pool-manager";
 import { MAX_UNLIMITED_ROWS } from "@/lib/db/utils/query-limiter";
+import { assertReadOnlyBudget, measureResultBytes } from "../read-only-budget";
 import type {
   ActiveSessionDetails,
   ColumnSchema,
@@ -37,19 +46,23 @@ import type {
   ObjectKindSpec,
   PerformanceMetrics,
   ProviderCapabilities,
+  ProviderExecutionContext,
   ProviderOptions,
   QueryResult,
   QueryWarning,
+  ReadOnlyStatementBudget,
+  ReadOnlyStatementMode,
   SlowQueryStats,
   StorageStats,
   TableStats,
 } from "@/lib/db/types";
 import { SQLBaseProvider } from "../sql-base";
-import { readCredentials } from "./auth";
+import { BIGQUERY_SCOPE, readCredentials } from "./auth";
 import {
   BigQueryApiError,
   type BigQueryField,
   type BigQueryDatasetRef,
+  type BigQueryDryRun,
   type BigQueryQueryResult,
   type BigQueryTableRef,
   type BigQueryTransport,
@@ -64,6 +77,32 @@ const DESCRIBE_CONCURRENCY = 8;
 const CATALOG_TTL_MS = 5 * 60_000;
 /** A catalog no region could be read for: kept shorter, but kept, since every retry bills two 10 MB jobs per region. */
 const NULL_CATALOG_TTL_MS = 60_000;
+const DEFAULT_MAX_BYTES_BILLED = 1024 ** 3;
+/** BigQuery's minimum billing; a smaller cap would fail every statement. */
+const MIN_BYTES_BILLED = 10 * 1024 * 1024;
+/** Resource Manager's testIamPermissions takes no narrower scope than cloud-platform.read-only. */
+const PROFILE_SCOPES = [BIGQUERY_SCOPE, "https://www.googleapis.com/auth/cloud-platform.read-only"];
+/** Project permissions that write, change access or reach outside BigQuery; a viewer (dataViewer + jobUser) holds none. */
+const AGENT_FORBIDDEN_PERMISSIONS = [
+  "bigquery.datasets.create",
+  "bigquery.datasets.update",
+  "bigquery.datasets.delete",
+  "bigquery.datasets.setIamPolicy",
+  "bigquery.tables.create",
+  "bigquery.tables.update",
+  "bigquery.tables.updateData",
+  "bigquery.tables.delete",
+  "bigquery.tables.setIamPolicy",
+  "bigquery.routines.create",
+  "bigquery.routines.update",
+  "bigquery.routines.delete",
+  "bigquery.models.create",
+  "bigquery.models.updateData",
+  "bigquery.models.delete",
+  "bigquery.connections.use",
+  "bigquery.transfers.update",
+  "resourcemanager.projects.setIamPolicy",
+];
 const MONITORING_MAX_ENTRIES = 50;
 /** A mutable object so a test can lower the cap; a region that reaches it is treated as unread, never truncated. */
 export const catalogLimits = { maxRows: 2_000_000 };
@@ -183,8 +222,12 @@ export class BigQueryProvider extends SQLBaseProvider {
   private readonly tableLists = new Map<string, { at: number; tables: Promise<BigQueryTableRef[]> }>();
   private catalogCache: { at: number; ttl: number; catalog: Promise<Catalog | null> } | null = null;
 
-  constructor(config: DatabaseConnection, options: ProviderOptions = {}) {
+  /** Opened under the agent read-only profile: only `queryReadOnly` may run a statement. */
+  private readonly readOnlyProfile: boolean;
+
+  constructor(config: DatabaseConnection, options: ProviderOptions = {}, execution: ProviderExecutionContext = {}) {
     super(config, options);
+    this.readOnlyProfile = execution.readOnly === true;
     this.validate();
   }
 
@@ -218,6 +261,13 @@ export class BigQueryProvider extends SQLBaseProvider {
     if (!this.config.database) {
       throw new DatabaseConfigError("BigQuery requires a project id in the database field", this.type);
     }
+    const cap = this.config.maxBytesBilled;
+    if (cap !== undefined && (!Number.isSafeInteger(cap) || cap < MIN_BYTES_BILLED)) {
+      throw new DatabaseConfigError(
+        `BigQuery maxBytesBilled must be a whole number of at least ${MIN_BYTES_BILLED} bytes (10 MiB, the least BigQuery bills), received ${String(cap)}`,
+        this.type,
+      );
+    }
   }
 
   protected override escapeIdentifier(identifier: string): string {
@@ -244,7 +294,10 @@ export class BigQueryProvider extends SQLBaseProvider {
         this.type,
       );
     }
-    const transport = createBigQueryTransport(this.project(), readCredentials(this.config.password));
+    const creds = readCredentials(this.config.password);
+    const transport = this.readOnlyProfile
+      ? createBigQueryTransport(this.project(), creds, process.env, PROFILE_SCOPES)
+      : createBigQueryTransport(this.project(), creds);
     try {
       // Without datasets.list the job location is left to BigQuery to infer; bad credentials still fail here.
       this.location =
@@ -264,14 +317,35 @@ export class BigQueryProvider extends SQLBaseProvider {
         ...(this.location ? { location: this.location } : {}),
         signal: this.deadline(),
       });
+      if (this.readOnlyProfile) await this.assertIdentityCannotWrite(transport);
     } catch (error) {
       transport.close();
-      const mapped = this.mapBigQueryError(error);
+      const mapped = error instanceof ExecutionProfileError ? error : this.mapBigQueryError(error);
       this.setError(mapped);
       throw mapped;
     }
     this.transport = transport;
     this.setConnected(true);
+  }
+
+  /** No read-only session exists, so the identity is the boundary under the dry-run gate, as on SQL Server. */
+  private async assertIdentityCannotWrite(transport: BigQueryTransport): Promise<void> {
+    const project = this.project();
+    let held: string[];
+    try {
+      held = await transport.testPermissions(AGENT_FORBIDDEN_PERMISSIONS, this.deadline());
+    } catch (error) {
+      throw new ExecutionProfileError(
+        `The agent read-only execution profile requires a viewer-only BigQuery identity, and this one's permissions on project ${project} could not be verified: ${error instanceof Error ? error.message : String(error)}. The check needs the Cloud Resource Manager API enabled and a token with the cloud-platform.read-only scope.`,
+        "PROFILE_PRIVILEGES_TOO_BROAD",
+      );
+    }
+    if (held.length > 0) {
+      throw new ExecutionProfileError(
+        `The agent read-only execution profile requires a viewer-only BigQuery identity; this one holds ${held.join(", ")} on project ${project}. Grant it only roles/bigquery.dataViewer and roles/bigquery.jobUser.`,
+        "PROFILE_PRIVILEGES_TOO_BROAD",
+      );
+    }
   }
 
   public async disconnect(): Promise<void> {
@@ -298,6 +372,13 @@ export class BigQueryProvider extends SQLBaseProvider {
 
   public async query(sql: string, params?: unknown[]): Promise<QueryResult> {
     const transport = this.requireTransport();
+    if (this.readOnlyProfile) {
+      throw new QueryError(
+        "A provider opened under the agent read-only profile runs queryReadOnly only",
+        this.type,
+        sql,
+      );
+    }
     // ponytail: no queryParameters mapping yet; add typed positional params when a caller needs them.
     if (params && params.length > 0) {
       throw new QueryError("BigQuery parameters are not supported yet; inline the values", this.type, sql);
@@ -329,6 +410,96 @@ export class BigQueryProvider extends SQLBaseProvider {
       } finally {
         if (!dryRun && this.isSchemaModifyingQuery(sql)) this.invalidateCatalog();
       }
+    });
+  }
+
+  /** No read-only session exists, so the dry run's `statementType` must be SELECT, under an identity checked at open. */
+  public async queryReadOnly(
+    sql: string,
+    budget: ReadOnlyStatementBudget,
+    mode: ReadOnlyStatementMode = "execute",
+  ): Promise<QueryResult> {
+    const transport = this.requireTransport();
+    assertReadOnlyBudget(budget, this.type);
+    if (!this.readOnlyProfile) {
+      throw new QueryError(
+        "Read-only execution requires a provider opened under the agent read-only profile",
+        this.type,
+        sql,
+      );
+    }
+    // ML.*, AI.* and EXTERNAL_QUERY bill outside maximumBytesBilled, on every path, not only MCP.
+    const violation = inspectAgentStatement(sql, { grammar: resolveSqlGrammar(this.type) });
+    if (violation !== null) {
+      throw new QueryError(`Read-only execution refuses this statement: ${violation}`, this.type, sql);
+    }
+
+    const started = Date.now();
+    const signal = this.deadline(budget.statementTimeoutMs);
+    // Only an operator-seeded connection may raise the cap.
+    const configured = this.config.maxBytesBilled ?? DEFAULT_MAX_BYTES_BILLED;
+    const cap = this.operatorSeeded() ? configured : Math.min(configured, DEFAULT_MAX_BYTES_BILLED);
+
+    return this.trackQuery(async () => {
+      const where = {
+        ...(this.config.schema ? { defaultDataset: this.config.schema } : {}),
+        ...(this.location ? { location: this.location } : {}),
+      };
+      let result: BigQueryQueryResult | null = null;
+      let dryRun: BigQueryDryRun;
+      try {
+        dryRun = await transport.dryRunStatement(sql, {
+          ...where,
+          signal,
+        });
+        if (dryRun.statementType === "SELECT" && mode === "execute") {
+          result = await transport.query(sql, {
+            ...where,
+            jobTimeoutMs: Math.max(budget.statementTimeoutMs - (Date.now() - started), 1),
+            // One past the budget, so an overrun is seen without fetching everything.
+            maxRows: budget.maxResultRows + 1,
+            maximumBytesBilled: cap,
+            signal,
+          });
+        }
+      } catch (error) {
+        throw this.mapBigQueryError(error, sql, budget.statementTimeoutMs);
+      }
+
+      if (dryRun.statementType !== "SELECT") {
+        throw new QueryError(
+          `Read-only execution refuses this statement: BigQuery classifies it as ${dryRun.statementType}, not SELECT`,
+          this.type,
+          sql,
+        );
+      }
+      if (result === null) {
+        const bytes = dryRun.totalBytesProcessed ?? 0;
+        return {
+          rows: [
+            { statement_type: dryRun.statementType, bytes_processed: bytes, bytes_processed_human: formatBytes(bytes) },
+          ],
+          fields: ["statement_type", "bytes_processed", "bytes_processed_human"],
+          rowCount: 1,
+          executionTime: 0,
+        };
+      }
+      if (result.rows.length > budget.maxResultRows) {
+        throw new QueryError(
+          `Read-only execution exceeded the row budget: more than ${budget.maxResultRows} rows`,
+          this.type,
+          sql,
+        );
+      }
+      const resultBytes = measureResultBytes(result.rows);
+      if (resultBytes > budget.maxResultBytes) {
+        throw new QueryError(
+          `Read-only execution exceeded the byte budget: ${resultBytes} bytes > ${budget.maxResultBytes} allowed`,
+          this.type,
+          sql,
+        );
+      }
+      return resultOf(result);
     });
   }
 

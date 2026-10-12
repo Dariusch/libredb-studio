@@ -4,9 +4,10 @@
 
 import { DatabaseConfigError } from "@/lib/db/errors";
 import { createNodeTransport, type NodeTransport, TransportError } from "@/lib/db/http/node-transport";
-import { createTokenSource, type GoogleCredentials, tokenOrigin } from "./auth";
+import { BIGQUERY_SCOPE, createTokenSource, type GoogleCredentials, tokenOrigin } from "./auth";
 
 const API_HOST = "bigquery.googleapis.com";
+const RESOURCE_MANAGER_HOST = "cloudresourcemanager.googleapis.com";
 const RESPONSE_BYTES = 64 * 1024 * 1024;
 const PAGE_ROWS = 10_000;
 
@@ -24,7 +25,20 @@ export interface BigQueryQueryOptions {
   readonly defaultDataset?: string;
   /** Where the job runs. Absent, BigQuery infers it from the referenced tables and falls back to US. */
   readonly location?: string;
+  /** A dry run ignores it. */
+  readonly maximumBytesBilled?: number;
   readonly signal: AbortSignal;
+}
+
+export interface BigQueryDryRunOptions {
+  readonly defaultDataset?: string;
+  readonly location?: string;
+  readonly signal: AbortSignal;
+}
+
+export interface BigQueryDryRun {
+  readonly statementType: string;
+  readonly totalBytesProcessed: number | null;
 }
 
 export interface BigQueryQueryResult {
@@ -65,9 +79,12 @@ export class BigQueryApiError extends Error {
 
 export interface BigQueryTransport {
   query(sql: string, options: BigQueryQueryOptions): Promise<BigQueryQueryResult>;
+  dryRunStatement(sql: string, options: BigQueryDryRunOptions): Promise<BigQueryDryRun>;
   listDatasets(signal: AbortSignal): Promise<BigQueryDatasetRef[]>;
   listTables(dataset: string, signal: AbortSignal): Promise<BigQueryTableRef[]>;
   getTable(dataset: string, table: string, signal: AbortSignal): Promise<BigQueryTable>;
+  /** Which of `permissions` the caller holds on the project (Resource Manager `projects.testIamPermissions`). */
+  testPermissions(permissions: readonly string[], signal: AbortSignal): Promise<string[]>;
   close(): void;
 }
 
@@ -151,10 +168,32 @@ export function apiOrigin(env: Readonly<Record<string, string | undefined>> = pr
   return { scheme, host: url.hostname, port: url.port ? Number(url.port) : scheme === "https" ? 443 : 80 };
 }
 
+/** The JSON object an answer carries, or a BigQueryApiError for an error status. */
+function answerOf(response: { status: number; text: string }): Wire {
+  let parsed: Wire = {};
+  try {
+    const value: unknown = JSON.parse(response.text);
+    if (value && typeof value === "object" && !Array.isArray(value)) parsed = value as Wire;
+  } catch {
+    // Non-JSON (proxy page): reported by status below.
+  }
+  if (response.status >= 400) {
+    const error = (parsed.error ?? {}) as { message?: unknown; errors?: unknown };
+    const reason = Array.isArray(error.errors) ? (error.errors[0] as { reason?: unknown } | null)?.reason : undefined;
+    throw new BigQueryApiError(
+      response.status,
+      typeof reason === "string" ? reason : null,
+      typeof error.message === "string" ? error.message : `BigQuery answered HTTP ${response.status}`,
+    );
+  }
+  return parsed;
+}
+
 export function createBigQueryTransport(
   project: string,
   creds: GoogleCredentials,
   env: Readonly<Record<string, string | undefined>> = process.env,
+  scopes: readonly string[] = [BIGQUERY_SCOPE],
 ): BigQueryTransport {
   // encodeURIComponent keeps "." and "..", which would climb out of /projects/ in the URL path.
   if (!/^[a-z][a-z0-9:.-]{0,200}$/i.test(project) || project === "." || project === "..") {
@@ -169,7 +208,7 @@ export function createBigQueryTransport(
     // The metadata server answers only requests that carry this header.
     headers: creds.type === "metadata" ? { "metadata-flavor": "Google" } : {},
   });
-  const token = createTokenSource(creds, oauth);
+  const token = createTokenSource(creds, oauth, Date.now, scopes);
   const api = apiOrigin(env);
   const base = `${new URL(`${api.scheme}://${api.host}:${api.port}`).origin}/bigquery/v2/projects/${encodeURIComponent(project)}`;
 
@@ -224,23 +263,7 @@ export function createBigQueryTransport(
       held.inFlight -= 1;
       retire(held);
     }
-    let parsed: Wire = {};
-    try {
-      const value: unknown = JSON.parse(response.text);
-      if (value && typeof value === "object" && !Array.isArray(value)) parsed = value as Wire;
-    } catch {
-      // Non-JSON (proxy page): reported by status below.
-    }
-    if (response.status >= 400) {
-      const error = (parsed.error ?? {}) as { message?: unknown; errors?: unknown };
-      const reason = Array.isArray(error.errors) ? (error.errors[0] as { reason?: unknown } | null)?.reason : undefined;
-      throw new BigQueryApiError(
-        response.status,
-        typeof reason === "string" ? reason : null,
-        typeof error.message === "string" ? error.message : `BigQuery answered HTTP ${response.status}`,
-      );
-    }
-    return parsed;
+    return answerOf(response);
   }
 
   /**
@@ -268,7 +291,7 @@ export function createBigQueryTransport(
       let job: { jobId: string; location?: string } | undefined;
       try {
         // An abort while this POST is still in flight cannot name the job (jobs.query takes no client job id), so
-        // that job runs on, bounded by jobTimeoutMs; jobs.insert with our own id would close it.
+        // that job runs on, bounded by jobTimeoutMs and maximumBytesBilled; jobs.insert with our own id would close it.
         let page = await call("POST", "/queries", options.signal, {
           query: sql,
           ...(options.location ? { location: options.location } : {}),
@@ -279,6 +302,7 @@ export function createBigQueryTransport(
           // int64 is a JSON string in the REST schema; the emulator refuses a number.
           jobTimeoutMs: String(options.jobTimeoutMs),
           formatOptions: { useInt64Timestamp: true },
+          ...(options.maximumBytesBilled ? { maximumBytesBilled: String(options.maximumBytesBilled) } : {}),
           ...(options.defaultDataset
             ? { defaultDataset: { projectId: project, datasetId: options.defaultDataset } }
             : {}),
@@ -326,6 +350,28 @@ export function createBigQueryTransport(
       }
     },
 
+    // Only jobs.insert returns `statistics.query.statementType`.
+    async dryRunStatement(sql, options) {
+      const job = await call("POST", "/jobs", options.signal, {
+        configuration: {
+          dryRun: true,
+          query: {
+            query: sql,
+            useLegacySql: false,
+            ...(options.defaultDataset
+              ? { defaultDataset: { projectId: project, datasetId: options.defaultDataset } }
+              : {}),
+          },
+        },
+        jobReference: { projectId: project, ...(options.location ? { location: options.location } : {}) },
+      });
+      const query = ((job.statistics as { query?: Wire } | undefined)?.query ?? {}) as Wire;
+      return {
+        statementType: typeof query.statementType === "string" ? query.statementType : "UNKNOWN",
+        totalBytesProcessed: num(query.totalBytesProcessed),
+      };
+    },
+
     async listDatasets(signal) {
       const ids: BigQueryDatasetRef[] = [];
       let pageToken: string | undefined;
@@ -364,6 +410,29 @@ export function createBigQueryTransport(
         signal,
       );
       return { fields: fieldsOf(t.schema) ?? [] };
+    },
+
+    async testPermissions(permissions, signal) {
+      const node = createNodeTransport({
+        origin: { scheme: "https", host: RESOURCE_MANAGER_HOST, port: 443 },
+        tls: tls(RESOURCE_MANAGER_HOST),
+        maxSockets: 1,
+        headers: { authorization: `Bearer ${await token(signal)}` },
+      });
+      try {
+        const held = answerOf(
+          await node.request({
+            method: "POST",
+            url: `https://${RESOURCE_MANAGER_HOST}/v1/projects/${encodeURIComponent(project)}:testIamPermissions`,
+            body: JSON.stringify({ permissions }),
+            signal,
+            maxResponseBytes: RESPONSE_BYTES,
+          }),
+        ).permissions;
+        return Array.isArray(held) ? held.filter((name): name is string => typeof name === "string") : [];
+      } finally {
+        node.close();
+      }
     },
 
     close() {

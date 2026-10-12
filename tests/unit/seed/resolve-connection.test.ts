@@ -44,12 +44,12 @@ describe("resolve-connection", () => {
       type: "bigquery",
       database: "p",
       managed: true,
-      location: "EU",
+      maxBytesBilled: 1024 ** 4,
       createdAt: new Date(),
     } as DatabaseConnection;
     const result = await resolveConnection({ connection: conn }, { role: "user", username: "test" });
     expect(result.managed).toBe(false);
-    expect(result.location).toBe("EU");
+    expect(result.maxBytesBilled).toBe(1024 ** 4);
   });
 
   /*

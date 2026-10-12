@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { BIGQUERY_DRY_RUN_MARKER } from "@/lib/explain/bigquery-dryrun";
 import type {
   BigQueryDatasetRef,
+  BigQueryDryRun,
+  BigQueryDryRunOptions,
   BigQueryQueryOptions,
   BigQueryQueryResult,
   BigQueryTable,
@@ -52,11 +54,19 @@ class FakeTransport implements BigQueryTransport {
     ],
   };
   tablesError: unknown = null;
+  dryRuns: { sql: string; options: BigQueryDryRunOptions }[] = [];
+  onDryRun: () => Promise<BigQueryDryRun> = async () => ({ statementType: "SELECT", totalBytesProcessed: 2048 });
   onQuery: (sql: string, options: BigQueryQueryOptions) => Promise<BigQueryQueryResult> = async () => result();
+  permissionChecks: string[][] = [];
+  onTestPermissions: (permissions: readonly string[]) => Promise<string[]> = async () => [];
 
   async query(sql: string, options: BigQueryQueryOptions): Promise<BigQueryQueryResult> {
     this.calls.push({ sql, options });
     return this.onQuery(sql, options);
+  }
+  async dryRunStatement(sql: string, options: BigQueryDryRunOptions): Promise<BigQueryDryRun> {
+    this.dryRuns.push({ sql, options });
+    return this.onDryRun();
   }
   async listDatasets(): Promise<BigQueryDatasetRef[]> {
     if (this.datasetsError) throw this.datasetsError;
@@ -80,6 +90,10 @@ class FakeTransport implements BigQueryTransport {
       ],
     };
   }
+  async testPermissions(permissions: readonly string[]): Promise<string[]> {
+    this.permissionChecks.push([...permissions]);
+    return this.onTestPermissions(permissions);
+  }
   close(): void {
     this.closed = true;
   }
@@ -100,7 +114,9 @@ mock.module("@/lib/db/providers/sql/bigquery/auth", () => ({
 }));
 
 const { BigQueryProvider, jobLocation, catalogLimits } = await import("@/lib/db/providers/sql/bigquery");
-const { AuthenticationError, DatabaseConfigError, QueryError, TimeoutError } = await import("@/lib/db/errors");
+const { AuthenticationError, DatabaseConfigError, ExecutionProfileError, QueryError, TimeoutError } = await import(
+  "@/lib/db/errors"
+);
 
 const base: DatabaseConnection = {
   id: "bq",
@@ -339,6 +355,198 @@ describe("query", () => {
 
   test("not connected", async () => {
     await expect(new BigQueryProvider(base).query("SELECT 1")).rejects.toBeInstanceOf(DatabaseConfigError);
+  });
+});
+
+describe("read-only profile and billed-bytes cap", () => {
+  const budget = { statementTimeoutMs: 5000, maxResultRows: 2, maxResultBytes: 1000 };
+  async function readOnly(over: Partial<DatabaseConnection> = {}) {
+    const provider = new BigQueryProvider({ ...base, ...over }, {}, { readOnly: true });
+    await provider.connect();
+    return provider;
+  }
+
+  test("under the profile, connect checks the identity's write permissions with the wider read-only scope", async () => {
+    await readOnly();
+    expect(createCalls[0].slice(2)).toEqual([
+      process.env,
+      ["https://www.googleapis.com/auth/bigquery", "https://www.googleapis.com/auth/cloud-platform.read-only"],
+    ]);
+    expect(fake.permissionChecks).toHaveLength(1);
+    expect(fake.permissionChecks[0]).toContain("bigquery.tables.updateData");
+    expect(fake.permissionChecks[0]).toContain("bigquery.connections.use");
+    expect(fake.permissionChecks[0]).not.toContain("bigquery.jobs.create");
+  });
+
+  test("outside the profile, connect checks nothing and keeps the BigQuery scope", async () => {
+    await connected();
+    expect(createCalls[0]).toHaveLength(2);
+    expect(fake.permissionChecks).toHaveLength(0);
+  });
+
+  test("an identity that can write is refused at connect, and the transport is closed", async () => {
+    fake.onTestPermissions = async () => ["bigquery.tables.updateData", "bigquery.datasets.create"];
+    const provider = new BigQueryProvider(base, {}, { readOnly: true });
+    const error = await provider.connect().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ExecutionProfileError);
+    expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("PROFILE_PRIVILEGES_TOO_BROAD");
+    expect((error as Error).message).toContain("bigquery.tables.updateData, bigquery.datasets.create");
+    expect((error as Error).message).toContain("my-proj");
+    expect(fake.closed).toBe(true);
+    expect(provider.isConnected()).toBe(false);
+  });
+
+  test("a permission check that cannot run refuses too: unverified is not viewer-only", async () => {
+    fake.onTestPermissions = async () => {
+      throw new BigQueryApiError(403, "ACCESS_TOKEN_SCOPE_INSUFFICIENT", "Request had insufficient scopes");
+    };
+    const error = await new BigQueryProvider(base, {}, { readOnly: true }).connect().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ExecutionProfileError);
+    expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("PROFILE_PRIVILEGES_TOO_BROAD");
+    expect((error as Error).message).toContain("could not be verified");
+    expect((error as Error).message).toContain("Request had insufficient scopes");
+  });
+
+  test("query() is refused under the read-only profile", async () => {
+    const provider = await readOnly();
+    await expect(provider.query("SELECT 1")).rejects.toBeInstanceOf(QueryError);
+  });
+
+  test("maxBytesBilled must be a safe integer of at least 10 MiB", () => {
+    for (const bad of [10485759, 1.5, Number.NaN, 2 ** 60]) {
+      expect(() => new BigQueryProvider({ ...base, maxBytesBilled: bad })).toThrow(DatabaseConfigError);
+    }
+    expect(() => new BigQueryProvider({ ...base, maxBytesBilled: 10485760 })).not.toThrow();
+  });
+
+  test("a bad budget, and a provider not opened read-only, are refused", async () => {
+    const provider = await readOnly();
+    await expect(provider.queryReadOnly("SELECT 1", { ...budget, maxResultRows: 0 })).rejects.toThrow();
+    const open = await connected();
+    await expect(open.queryReadOnly("SELECT 1", budget)).rejects.toBeInstanceOf(QueryError);
+    await expect(
+      new BigQueryProvider(base, {}, { readOnly: true }).queryReadOnly("SELECT 1", budget),
+    ).rejects.toBeInstanceOf(DatabaseConfigError);
+  });
+
+  test("anything the engine does not classify as SELECT is refused, and nothing runs", async () => {
+    const provider = await readOnly();
+    const before = fake.calls.length;
+    for (const statementType of ["INSERT", "SCRIPT"]) {
+      fake.onDryRun = async () => ({ statementType, totalBytesProcessed: null });
+      await expect(provider.queryReadOnly("SELECT 1", budget)).rejects.toThrow(`classifies it as ${statementType}`);
+      await expect(provider.queryReadOnly("SELECT 1", budget, "estimate-plan")).rejects.toBeInstanceOf(QueryError);
+    }
+    expect(fake.calls.length).toBe(before);
+  });
+
+  test("a call billed outside maximumBytesBilled, or a non-read, is refused before any dry run", async () => {
+    const provider = await readOnly();
+    for (const sql of [
+      "SELECT * FROM ML.PREDICT(MODEL `d.m`, TABLE `d.t`)",
+      "SELECT * FROM EXTERNAL_QUERY('conn', 'SELECT 1')",
+      "DELETE FROM t WHERE true",
+    ]) {
+      await expect(provider.queryReadOnly(sql, budget)).rejects.toThrow("Read-only execution refuses this statement: ");
+    }
+    expect(fake.dryRuns).toHaveLength(0);
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  test("a timeout reports the budget's statement timeout", async () => {
+    const provider = await readOnly();
+    fake.onDryRun = async () => {
+      throw new TransportError("timeout", "timed out");
+    };
+    const error = await provider.queryReadOnly("SELECT 1", budget).catch((e) => e);
+    expect(error).toBeInstanceOf(TimeoutError);
+    expect(error.timeout).toBe(5000);
+  });
+
+  test("a SELECT runs with the default cap, the dataset, the location and a row ceiling of budget + 1", async () => {
+    const provider = await readOnly();
+    const now = spyOn(Date, "now").mockReturnValue(1_000_000);
+    fake.onQuery = async () => result({ fields: [{ name: "id", type: "INT64" }], rows: [{ id: 1 }, { id: 2 }] });
+    const r = await provider.queryReadOnly("SELECT id FROM t", budget);
+    const options = fake.calls.at(-1)?.options;
+    expect(options).toMatchObject({
+      defaultDataset: "sales",
+      location: "EU",
+      jobTimeoutMs: 5000,
+      maxRows: 3,
+      maximumBytesBilled: 1024 ** 3,
+    });
+    expect(fake.dryRuns.at(-1)?.options).toMatchObject({ defaultDataset: "sales", location: "EU" });
+    expect(r.rowCount).toBe(2);
+    expect(r.columnTypes).toEqual({ id: "INT64" });
+  });
+
+  test("the dry run and the run share one deadline and the remaining job time", async () => {
+    const provider = await readOnly();
+    const now = spyOn(Date, "now").mockReturnValue(1_000_000);
+    fake.onDryRun = async () => {
+      now.mockReturnValue(1_002_000);
+      return { statementType: "SELECT", totalBytesProcessed: 1 };
+    };
+    await provider.queryReadOnly("SELECT 1", budget);
+    expect(fake.calls.at(-1)?.options.jobTimeoutMs).toBe(3000);
+    expect(fake.calls.at(-1)?.options.signal).toBe(fake.dryRuns.at(-1)?.options.signal);
+    fake.onDryRun = async () => {
+      now.mockReturnValue(1_009_000);
+      return { statementType: "SELECT", totalBytesProcessed: 1 };
+    };
+    await provider.queryReadOnly("SELECT 1", budget);
+    expect(fake.calls.at(-1)?.options.jobTimeoutMs).toBe(1);
+  });
+
+  test("a user connection cannot raise the cap above 1 GiB; a managed one can", async () => {
+    const big = 4 * 1024 ** 3;
+    await (await readOnly({ maxBytesBilled: big })).queryReadOnly("SELECT 1", budget);
+    expect(fake.calls.at(-1)?.options.maximumBytesBilled).toBe(1024 ** 3);
+    await (await readOnly({ maxBytesBilled: big, managed: true })).queryReadOnly("SELECT 1", budget);
+    expect(fake.calls.at(-1)?.options.maximumBytesBilled).toBe(big);
+  });
+
+  test("a configured cap is sent, and no dataset or location is sent when there is none", async () => {
+    fake.datasets = [];
+    const provider = await readOnly({ schema: undefined, maxBytesBilled: 20971520 });
+    await provider.queryReadOnly("SELECT 1", budget);
+    const options = fake.calls.at(-1)?.options;
+    expect(options?.maximumBytesBilled).toBe(20971520);
+    expect(options?.defaultDataset).toBeUndefined();
+    expect(options?.location).toBeUndefined();
+  });
+
+  test("the row budget and the byte budget are enforced", async () => {
+    const provider = await readOnly();
+    fake.onQuery = async () => result({ rows: [{ a: 1 }, { a: 2 }, { a: 3 }] });
+    await expect(provider.queryReadOnly("SELECT 1", budget)).rejects.toThrow("row budget");
+    fake.onQuery = async () => result({ rows: [{ a: "x".repeat(2000) }] });
+    await expect(provider.queryReadOnly("SELECT 1", budget)).rejects.toThrow("byte budget");
+  });
+
+  test("estimate-plan answers the dry-run estimate and runs nothing", async () => {
+    const provider = await readOnly();
+    const before = fake.calls.length;
+    const r = await provider.queryReadOnly("SELECT 1", budget, "estimate-plan");
+    expect(r.rows).toEqual([{ statement_type: "SELECT", bytes_processed: 2048, bytes_processed_human: "2 KB" }]);
+    expect(r.fields).toEqual(["statement_type", "bytes_processed", "bytes_processed_human"]);
+    expect(fake.calls.length).toBe(before);
+    fake.onDryRun = async () => ({ statementType: "SELECT", totalBytesProcessed: null });
+    expect((await provider.queryReadOnly("SELECT 1", budget, "estimate-plan")).rows[0].bytes_processed).toBe(0);
+  });
+
+  test("transport errors are mapped, from the dry run and from the run", async () => {
+    const provider = await readOnly();
+    fake.onDryRun = async () => {
+      throw new BigQueryApiError(400, "invalidQuery", "Syntax error");
+    };
+    await expect(provider.queryReadOnly("SELECT nope", budget)).rejects.toBeInstanceOf(QueryError);
+    fake.onDryRun = async () => ({ statementType: "SELECT", totalBytesProcessed: 1 });
+    fake.onQuery = async () => {
+      throw new BigQueryApiError(400, "invalid", "Query exceeded limit for bytes billed");
+    };
+    await expect(provider.queryReadOnly("SELECT 1", budget)).rejects.toThrow("bytes billed");
   });
 });
 

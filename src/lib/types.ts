@@ -429,6 +429,8 @@ export interface DatabaseConnection {
    * An AMQP 0-9-1 port, digits only. Read by no engine yet.
    */
   amqpPort?: string;
+  /** BigQuery only: billed-bytes cap for AI-client statements (default 1 GiB, min 10 MiB); only `managed` may raise it. */
+  maxBytesBilled?: number;
   /**
    * Read no catalog when this connection opens.
    *

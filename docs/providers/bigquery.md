@@ -35,7 +35,7 @@
 
 | File                                                                         | Role                                                                                                |
 | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `src/lib/db/providers/sql/bigquery/index.ts`                                 | The provider: capabilities, query, object surface, catalog cache, monitoring                       |
+| `src/lib/db/providers/sql/bigquery/index.ts`                                 | The provider: capabilities, query, `queryReadOnly`, object surface, catalog cache, monitoring       |
 | `src/lib/db/providers/sql/bigquery/transport.ts`                             | The only file that knows the REST envelope: jobs, dry runs, paging, datasets, tables, cell decoding |
 | `src/lib/db/providers/sql/bigquery/auth.ts`                                  | Credential resolution and the token source                                                          |
 | `src/lib/explain/bigquery-dryrun.ts`                                         | The EXPLAIN strategy that turns a statement into a dry run                                          |
@@ -51,6 +51,7 @@
 | `schema`         | Default dataset                          | No       | Unqualified table names resolve here; it also decides the job location                                                                                          |
 | `password`       | Service-account key JSON or access token | No       | The whole key file's JSON, or a bearer token. Empty means the server's own credentials ([§3.2](#32-credentials))                                                |
 | `location`       | Location                                 | No       | Where jobs run, e.g. `EU`, `US`, `europe-west3`. Empty means detected ([§5.3](#53-job-location))                                                                |
+| `maxBytesBilled` | Max bytes billed (AI clients)            | No       | Most bytes one AI-client statement may bill; whole number, at least 10485760 (10 MiB). Empty means 1 GiB ([§6.1](#61-read-only-execution-mcp-and-the-ai-agent)) |
 
 Host and port are not shown: the connection form draws them only for engines that declare them.
 The SSL / TLS and SSH tunnel panels are not shown either (`showSslPanel: false`, `showSshTunnel: false`): every request is HTTPS to `googleapis.com` checked against the system trust store, and a tunnel would forward one address of the several the provider reaches (the API, the token endpoint, the metadata server).
@@ -74,7 +75,7 @@ Without the flag and without a key, the connection is refused with a message tha
 
 Tokens are cached and refreshed a minute before they expire, and concurrent callers share one refresh instead of each minting a grant.
 A server credentials file that cannot be read is reported without its path (the path goes to the server log).
-The provider cache key includes `location`, so changing it gets a new provider instead of the cached one.
+The provider cache key includes `location` and `maxBytesBilled`, so changing either gets a new provider instead of the cached one.
 The shared transport treats `Authorization` as a connection header, so each token gets its own transport, and a replaced one closes once its in-flight requests finish.
 
 ### 3.3 Required IAM
@@ -110,6 +111,7 @@ connections:
     database: "rmt-integration"          # project id
     schema: "analytics"                  # optional default dataset
     location: "EU"                       # optional; detected when absent
+    maxBytesBilled: 1073741824           # optional; AI-client statements only, default 1 GiB
     password: "${BQ_INTEGRATION_SA_JSON}"
     roles: ["admin", "user"]
 
@@ -176,6 +178,9 @@ The statement reader that decides where a statement ends, whether a keyword is r
 - `'''…'''` and `"""…"""` are string literals that may hold lone quotes, semicolons and line feeds, so a `DROP` or a `;` inside one is text and no longer raises a confirmation prompt.
 - A backslash escapes a backtick inside a backtick name (`` `a\`b` `` is one name), and a doubled backtick is a syntax error, so a `;` hidden behind an escaped backtick is split the way BigQuery runs it (`backtickBackslashEscapes`).
 - `[…]` is an array literal or a subscript, never a name.
+- The agent statement guard also refuses `ML.*`, `AI.*` and `EXTERNAL_QUERY` under this grammar (`agentRefusedCalls`): they call Vertex AI or run SQL on a Cloud SQL replica, which the billed-bytes cap does not bound.
+  The check reads name paths token by token: comments and whitespace between `ML` and `.` do not hide it, and a backtick name is unquoted and split, so `` `ML`.DISTANCE `` and `` `ML.DISTANCE` `` are refused too (each was measured to resolve to the real function). `queryReadOnly` runs it for every caller, the in-app agent and MCP alike.
+  The rule over-refuses a table aliased `ml` or `ai` that is then qualified (`ml.x`); rename the alias. A user-named remote function has no word to match and is not detected.
 
 A script (`BEGIN … END`) is not split: the shared splitter does not model it.
 
@@ -190,10 +195,27 @@ The editor uses it twice:
 - **Explain** renders "Dry run: 1.2 GB would be processed".
 - **Live badge**: while the person types, a debounced dry run (800 ms) shows "This query will process 1.2 GB when run." in the editor's corner, or the validation error in red. It is drawn only for connections whose EXPLAIN format is `bigquery-dryrun`.
 
-### 6.1 AI clients
+### 6.1 Read-only execution (MCP and the AI agent)
 
-The provider implements no `queryReadOnly`, so MCP `run_read_query` and agent mode refuse a BigQuery connection.
-`list_connections`, `inspect_schema` and plan mode work, because they read the object surface and send no statement.
+`queryReadOnly` runs one statement for an AI client (the MCP server, the in-app agent) on a provider opened under the agent read-only profile.
+BigQuery has no read-only session, so the boundary is a viewer-only identity, BigQuery's own parser and a billed-bytes cap.
+
+- **Identity check at open**: the provider asks Cloud Resource Manager (`projects.testIamPermissions`) which of a fixed list of write and access permissions the identity holds on the project (`bigquery.tables.updateData`, `bigquery.datasets.create`, `bigquery.connections.use`, `resourcemanager.projects.setIamPolicy` and the rest of `AGENT_FORBIDDEN_PERMISSIONS`). Any one held refuses the open with `PROFILE_PRIVILEGES_TOO_BROAD`; `roles/bigquery.dataViewer` with `roles/bigquery.jobUser` holds none.
+  It fails closed: when the check cannot run, the open is refused as unverified. The check needs the Cloud Resource Manager API enabled and a token with the `cloud-platform.read-only` scope, which the provider requests (with the `bigquery` scope) for a service-account key or the metadata server only under this profile. A pasted access token must already carry it; `gcloud auth print-access-token` does.
+
+- **Statement gate**: the statement is dry-run first (`jobs.insert` with `dryRun`), and only a `statementType` of `SELECT` runs. Scripts, DML, DDL and `EXPORT DATA` are refused with a `QueryError` and nothing is executed.
+- **Estimate**: in `estimate-plan` mode the dry-run result is the answer, one row `{ statement_type, bytes_processed, bytes_processed_human }`, and nothing runs.
+- **Plain `query()`**: a provider opened under the read-only profile refuses it; only `queryReadOnly` runs a statement.
+- **Who sets the cap**: an operator-seeded (managed) connection may set any value of at least 10 MiB; a connection a user created in the form can only lower it, so its effective cap is never above 1 GiB.
+  The form refuses a value that is not a whole number of at most 15 digits, or that is below 10485760 (10 MiB), with "Nothing was sent".
+- **Billed-bytes cap**: `maxBytesBilled` (default 1 GiB, minimum 10 MiB, which is BigQuery's minimum billing) is sent as `maximumBytesBilled` on the real run. The job fails before it runs with `Query exceeded limit for bytes billed`, measured on 2026-10-11 against an 82 MB table with a 10 MiB cap. A dry run ignores the cap, so it is applied to the real run. Only AI-client statements carry it, never the editor.
+- **Budget**: the row cap, the byte cap on the result and the timeout come from the caller's budget; one row more than the row cap is fetched so an overrun is seen without downloading everything.
+  The dry run and the run share one statement-timeout budget, so the total is not twice the budget.
+
+Limits:
+
+- The identity check reads project-level permissions only. A write grant on one dataset (a dataset ACL or dataset IAM binding) is not seen; the statement gate still refuses the write.
+- The cap does not bound BigQuery ML or AI function costs, which are billed outside bytes.
 
 ## 7. Schema introspection
 
@@ -245,17 +267,18 @@ Uptime, connections and indexes have no BigQuery counterpart and stay empty.
 
 ## 9. Tests
 
-| Test                                             | Covers                                                                                                                               |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `tests/unit/db/bigquery/decode.test.ts`          | Cell decoding, the dry-run strategy, job location selection                                                                          |
-| `tests/integration/db/bigquery-provider.test.ts` | The provider, transport and auth end to end over a fake REST server: connect, query, object surface (shared conformance), monitoring |
-| `tests/unit/db/bigquery/provider.test.ts`        | The provider over a fake transport                                                                                                   |
-| `tests/unit/db/bigquery/transport.test.ts`       | The REST envelope: `jobs.query`, the dry run, paging, job cancel, token lanes                                                        |
-| `tests/unit/db/bigquery/credentials.test.ts`     | Credential resolution order and the server-credentials opt-in                                                                        |
-| `tests/unit/db/bigquery/token-source.test.ts`    | Token minting, caching and single-flight refresh                                                                                     |
-| `tests/unit/sql-completions.test.ts`             | Qualified table labels                                                                                                               |
-| `tests/unit/sql/bigquery-grammar.test.ts`        | The BigQuery statement grammar: triple quotes, `#` comments, escapes, subscripts                                                     |
-| `tests/live/bigquery-live-check.ts`              | Hand-run, against goccy/bigquery-emulator; not in `bun run test` (see below)                                                         |
+| Test                                             | Covers                                                                                                                                                    |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tests/unit/db/bigquery/decode.test.ts`          | Cell decoding, the dry-run strategy, job location selection                                                                                               |
+| `tests/integration/db/bigquery-provider.test.ts` | The provider, transport and auth end to end over a fake REST server: connect, query, object surface (shared conformance), monitoring, read-only execution |
+| `tests/unit/db/bigquery/provider.test.ts`        | The provider over a fake transport, including `queryReadOnly`, the identity check and the billed-bytes cap                                                |
+| `tests/unit/db/bigquery/transport.test.ts`       | The REST envelope: `jobs.query`, the dry run, `maximumBytesBilled`, paging, job cancel, token lanes, `testIamPermissions`                                 |
+| `tests/unit/db/bigquery/statement-guard.test.ts` | The statement guard under the BigQuery grammar                                                                                                            |
+| `tests/unit/db/bigquery/credentials.test.ts`     | Credential resolution order and the server-credentials opt-in                                                                                             |
+| `tests/unit/db/bigquery/token-source.test.ts`    | Token minting, scopes, caching and single-flight refresh                                                                                                  |
+| `tests/unit/sql-completions.test.ts`             | Qualified table labels                                                                                                                                    |
+| `tests/unit/sql/bigquery-grammar.test.ts`        | The BigQuery statement grammar: triple quotes, `#` comments, escapes, subscripts                                                                          |
+| `tests/live/bigquery-live-check.ts`              | Hand-run, against goccy/bigquery-emulator; not in `bun run test` (see below)                                                                              |
 
 ### 9.1 Live check against the emulator
 

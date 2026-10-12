@@ -14,6 +14,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { quoteLiteral } from "@/lib/sql/values";
+import { resolveSqlGrammar } from "@/lib/sql/grammar";
 
 /**
  * The SQL the SERVER composes (#329 T6, planning decision P1).
@@ -1148,7 +1149,9 @@ describe("the composers are reachable, which is the defect that put this file he
   test("every execution engine composes every kind rather than refusing UNSUPPORTED_DIALECT", () => {
     for (const dialect of AGENT_EXECUTION_ENGINES) {
       for (const kind of ["columns", "relations", "indexes", "statistics"] as const) {
-        expect(() => composeCatalogRead(dialect, { kind }), `${dialect}/${kind}`).not.toThrow(AgentComposedSqlError);
+        // BigQuery's catalog is per dataset and refuses a read that names none.
+        const selector = dialect === "bigquery" ? { kind, schema: "ds" } : { kind };
+        expect(() => composeCatalogRead(dialect, selector), `${dialect}/${kind}`).not.toThrow(AgentComposedSqlError);
       }
       expect(() => composeEstimatingExplain(dialect, "SELECT 1"), dialect).not.toThrow(AgentComposedSqlError);
     }
@@ -1518,5 +1521,39 @@ describe("composeCatalogRead — the SQL Server selector is a Unicode literal", 
 
     expect(sql).not.toContain("s.name = N'");
     expect(sql).not.toContain("o.name = N'");
+  });
+});
+
+describe("composeCatalogRead — BigQuery", () => {
+  test.each([
+    ["columns", "`ds`.INFORMATION_SCHEMA.COLUMNS"],
+    ["relations", "`ds`.INFORMATION_SCHEMA.TABLES"],
+    ["indexes", "`ds`.INFORMATION_SCHEMA.SEARCH_INDEXES"],
+    ["statistics", "`ds`.__TABLES__"],
+  ] as const)("%s reads the dataset's own catalog and passes the BigQuery-grammar guard", (kind, source) => {
+    const sql = composeCatalogRead("bigquery", { kind, schema: "ds" });
+
+    expect(sql).toContain(source);
+    expect(inspectAgentStatement(sql, { grammar: resolveSqlGrammar("bigquery") })).toBeNull();
+  });
+
+  test("a table selector is a backslash-escaped literal and the dataset a backslash-escaped name", () => {
+    const sql = composeCatalogRead("bigquery", { schema: "d`s", table: "o'rders" });
+
+    expect(sql).toContain("`d\\`s`.INFORMATION_SCHEMA.COLUMNS");
+    expect(sql).toContain("table_name = 'o\\'rders'");
+  });
+
+  test.each(["columns", "relations", "indexes", "statistics"] as const)("%s without a dataset is refused", (kind) => {
+    expect(() => composeCatalogRead("bigquery", { kind })).toThrow(
+      expect.objectContaining({ reasonCode: "SELECTOR_UNSUPPORTED_BY_DIALECT" }),
+    );
+  });
+
+  test("the estimating plan is the statement itself in estimate-plan mode", () => {
+    expect(composeEstimatingExplain("bigquery", "EXPLAIN SELECT 1")).toEqual({
+      sql: "SELECT 1",
+      mode: "estimate-plan",
+    });
   });
 });

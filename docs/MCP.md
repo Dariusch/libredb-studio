@@ -17,10 +17,11 @@ It is off by default.
     On Milvus it lists the collection's declared fields, with the dynamic field as one `$meta` column and never a key inside it.
     On Qdrant it lists payload-index fields and vectors only, and says that other payload keys may exist: the keys Studio samples from points never reach an MCP client.
     On InfluxDB (InfluxQL) it lists measurements with their tag and field keys, and on InfluxDB 3 (SQL) tables with their columns; the `_internal` database and the `system.*` tables of a 3.x server are never returned.
+    On BigQuery it lists a dataset's tables, views and materialized views, so the call names a dataset.
     On Databend it lists tables, views, materialized views and dynamic tables; on a Databend Cloud connection with a Warehouse set, a call resumes a suspended warehouse, which bills while it runs, as any statement does.
   - `run_read_query` runs one read-only statement: a `SELECT` (a `WITH` is fine), `VALUES`, `TABLE`, or `EXPLAIN` without `ANALYZE`.
-    Runs on PostgreSQL, SQLite, DuckDB and SQL Server; other engines refuse it, so use inspect_schema there.
-- Read-only is the database's own enforcement, not a filter over SQL text: `run_read_query` takes the connection under Studio's agent read-only execution profile and runs through the provider's read-only statement path, which PostgreSQL enforces with a read-only transaction, SQLite and DuckDB with a read-only open, and SQL Server by verifying the principal cannot write.
+    Runs on PostgreSQL, SQLite, DuckDB, SQL Server and BigQuery; other engines refuse it, so use inspect_schema there.
+- Read-only is the database's own enforcement, not a filter over SQL text: `run_read_query` takes the connection under Studio's agent read-only execution profile and runs through the provider's read-only statement path, which PostgreSQL enforces with a read-only transaction, SQLite and DuckDB with a read-only open, SQL Server by verifying the principal cannot write, and BigQuery by the engine's own statement classification from a dry run.
   A statement check runs first as defence in depth.
 - A result that carries database content starts with a text block telling the model to treat what follows as untrusted data.
 
@@ -103,6 +104,23 @@ On PostgreSQL the seed's role must not be a superuser and must not hold `pg_read
 On SQL Server the login must hold no fixed server role, neither `CONTROL SERVER` nor `ADMINISTER BULK OPERATIONS`, and none of `db_owner`, `db_accessadmin`, `db_securityadmin`, `db_ddladmin`, `db_backupoperator` or `db_datawriter`, and it must be granted `SHOWPLAN`.
 A seed entry cannot carry a separate agent credential, so the fix is the seed's own login.
 `inspect_schema` acquires its connection under the same read-only execution context as `run_read_query` (both verify the principal at open, not per statement), so the same least-privilege requirement applies there too: a superuser PostgreSQL role or a privileged SQL Server login refuses `inspect_schema` as well.
+
+### BigQuery
+
+```yaml
+connections:
+  - id: warehouse
+    name: Warehouse
+    type: bigquery
+    database: my-gcp-project
+    roles: ["*"]
+    mcp: true
+    maxBytesBilled: 1073741824
+```
+
+`database` is the Google Cloud project that runs and bills the queries.
+`maxBytesBilled` is the most bytes one statement may bill for an AI client, in bytes: the default is 1 GiB and the minimum 10 MiB, and an MCP client cannot change it per call.
+Give the seed a viewer-only service account with `roles/bigquery.jobUser` and `roles/bigquery.dataViewer`: at open Studio asks Cloud Resource Manager which write permissions it holds on the project and refuses one that holds any, or whose permissions it cannot read (enable the Cloud Resource Manager API).
 
 ## Getting a token
 
@@ -284,6 +302,9 @@ For the first few seconds after that service starts, `opencode mcp list` can say
 - Studio honours a cancel only when the client closes the request.
   A 2026-07-28 client does that on every cancel, and a 2025 client only by disconnecting.
   A 2025 client's `notifications/cancelled`, sent in a `POST` of its own, gets 202 and is ignored, because each `POST` is answered by a server that keeps no session and does not know the call it names: the call runs to completion or `timeout_ms`, answers on the request that is still open, and is audited that way, never as cancelled.
+- On BigQuery the read-only boundary is the engine's own statement classification from a dry run, not a read-only session: only a `SELECT` runs, and scripts, DML and DDL are refused, with the billed-bytes cap on top.
+  The identity's project permissions are checked at open, so an identity that can write is refused; a write grant on a single dataset is not seen by that check.
+  The cap does not bound BigQuery ML or AI function costs, which bill outside bytes, so the statement guard refuses `ML.*`, `AI.*` and `EXTERNAL_QUERY` (also when written with comments between tokens or as backtick names); a user-named remote function is not detected.
 - A cancel or a timeout ends the wait, not the statement:
 
 | Engine | The client closes the request | `timeout_ms` passes |
@@ -291,6 +312,7 @@ For the first few seconds after that service starts, `opencode mcp list` can say
 | PostgreSQL | Studio stops waiting; the statement runs on until `statement_timeout`, which is set to the time left | The database ends the statement, and the client gets the timeout answer |
 | SQL Server | Studio stops waiting; the statement runs until the provider's deadline cancels it | The provider cancels the statement, and the client gets the timeout answer |
 | DuckDB | Studio stops waiting; the statement runs to completion and its result is discarded | The client gets the timeout answer near `timeout_ms`, and the statement runs on |
+| BigQuery | Studio stops waiting and sends a best-effort cancel for the job | BigQuery cancels the job when its job timeout (`jobTimeoutMs`) passes, and the client gets the timeout answer |
 | SQLite | An on-disk statement runs in a killable child process, so the client is answered at `timeout_ms` | The statement is killed at `timeout_ms`; an in-memory statement still runs to completion |
 
 - One MCP query against a large SQLite table no longer stops the Studio process: the read runs in a

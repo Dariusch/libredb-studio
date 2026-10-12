@@ -64,7 +64,7 @@ const MOCK_CONNECTION_FIELDS: Record<string, string[]> = {
   oxia: ["host", "port", "password", "database", "dataServers", "allowInsecureAuth"],
   // The warehouse and the consent to a cleartext password are fields of Databend's own (design 6.1).
   databend: ["host", "port", "user", "password", "database", "warehouse", "allowInsecureAuth"],
-  bigquery: ["database", "schema", "password", "location"],
+  bigquery: ["database", "schema", "password", "location", "maxBytesBilled"],
   // The signing region and the consent to plain HTTP are fields of S3's own.
   s3: ["host", "port", "user", "password", "database", "region", "allowInsecureAuth"],
   // No User: basic authentication is refused; the token is the password, the default namespace the database, and the
@@ -84,10 +84,22 @@ const mockFields = (type: string): string[] =>
 const MOCK_USER_REQUIRED = "User is required (mock).";
 const MOCK_WAREHOUSE_FORMAT = "Warehouse must be a warehouse name (mock).";
 const MOCK_REGION_FORMAT = "Region must be a region name (mock).";
-const MOCK_FORMAT_SENTENCES: Record<string, string> = { warehouse: MOCK_WAREHOUSE_FORMAT, region: MOCK_REGION_FORMAT };
-const MOCK_FIELD_RULES: Record<string, Record<string, { required?: string; format?: RegExp }>> = {
+const MOCK_BYTES_FORMAT = "Max bytes billed must be a whole number of bytes (mock).";
+const MOCK_BYTES_MINIMUM = "Max bytes billed must be at least 10 MiB (mock).";
+const MOCK_FORMAT_SENTENCES: Record<string, string> = {
+  warehouse: MOCK_WAREHOUSE_FORMAT,
+  region: MOCK_REGION_FORMAT,
+  maxBytesBilled: MOCK_BYTES_FORMAT,
+};
+const MOCK_FIELD_RULES: Record<
+  string,
+  Record<string, { required?: string; format?: RegExp; minimum?: { value: number; sentence: string } }>
+> = {
   databend: { user: { required: MOCK_USER_REQUIRED }, warehouse: { format: /^[A-Za-z0-9_-]{1,63}$/ } },
   s3: { region: { format: /^[A-Za-z0-9_-]{1,64}$/ } },
+  bigquery: {
+    maxBytesBilled: { format: /^\d{1,15}$/, minimum: { value: 10 * 1024 * 1024, sentence: MOCK_BYTES_MINIMUM } },
+  },
 };
 const mockFieldRefusal = (config: { label: string }, connection: Record<string, unknown>): string | undefined => {
   const rules = MOCK_FIELD_RULES[config.label.toLowerCase()] ?? {};
@@ -99,6 +111,8 @@ const mockFieldRefusal = (config: { label: string }, connection: Record<string, 
       const sentence = MOCK_FORMAT_SENTENCES[field];
       if (sentence === undefined) throw new Error(`the mock declares no format sentence for ${field}`);
       return sentence;
+    } else if (rule.minimum && !(Number(value) >= rule.minimum.value)) {
+      return rule.minimum.sentence;
     }
   }
   return undefined;
@@ -4394,5 +4408,101 @@ describe("a databend:// paste (Databend design 6.2)", () => {
   test("the unparsed-paste sentence names databend://", () => {
     const result = paste("ftp://nowhere");
     expect(result.current.testResult!.message).toContain("databend://");
+  });
+});
+
+describe("the maxBytesBilled field (BigQuery)", () => {
+  const props = {
+    isOpen: true,
+    onClose: mock(() => {}),
+    onConnect: mock<(connection: DatabaseConnection) => void>(() => {}),
+    onTestConnection: async () => ({ success: true }),
+    editConnection: null as DatabaseConnection | null,
+  };
+  beforeEach(() => {
+    props.onConnect.mockClear();
+  });
+
+  const saved = async (result: { current: ReturnType<typeof useConnectionForm> }) => {
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+    expect(props.onConnect).toHaveBeenCalledTimes(1);
+    return props.onConnect.mock.calls[0][0];
+  };
+
+  const bigquery = (value: string) => {
+    const hook = renderHook(() => useConnectionForm(props));
+    act(() => hook.result.current.setType("bigquery"));
+    act(() => hook.result.current.setDatabase("my-proj"));
+    act(() => hook.result.current.setMaxBytesBilled(value));
+    return hook.result;
+  };
+
+  test("a typed cap is built as a number", async () => {
+    expect((await saved(bigquery(" 20971520 "))).maxBytesBilled).toBe(20971520);
+  });
+
+  test("an empty box writes no key", async () => {
+    expect(await saved(bigquery("  "))).not.toHaveProperty("maxBytesBilled");
+  });
+
+  test.each(["10MB", "1 GiB", "1,000,000", "1e400", "-5", "9".repeat(400)])(
+    "typed %p is refused by the field rule and nothing is stored",
+    async (typed) => {
+      const hook = bigquery(typed);
+      await act(async () => {
+        await hook.current.handleConnect();
+      });
+      expect(props.onConnect).not.toHaveBeenCalled();
+      expect(hook.current.testResult).toEqual({ tone: "error", message: MOCK_BYTES_FORMAT });
+    },
+  );
+
+  test("a cap below the 10 MiB BigQuery bills at least is refused by the field rule and nothing is stored", async () => {
+    const hook = bigquery("5");
+    await act(async () => {
+      await hook.current.handleConnect();
+    });
+    expect(props.onConnect).not.toHaveBeenCalled();
+    expect(hook.current.testResult).toEqual({ tone: "error", message: MOCK_BYTES_MINIMUM });
+  });
+
+  test("a type that does not take the field drops it", async () => {
+    const hook = renderHook(() => useConnectionForm(props));
+    act(() => hook.result.current.setType("bigquery"));
+    act(() => hook.result.current.setMaxBytesBilled("20971520"));
+    act(() => hook.result.current.setType("postgres"));
+    expect(await saved(hook.result)).not.toHaveProperty("maxBytesBilled");
+  });
+
+  test("editing loads the stored cap, and a connection without one shows an empty box", () => {
+    const capped: DatabaseConnection = {
+      id: "c1",
+      name: "BQ",
+      type: "bigquery",
+      database: "my-proj",
+      maxBytesBilled: 20971520,
+      createdAt: new Date(),
+    };
+    const { result, rerender } = renderHook((p) => useConnectionForm(p), {
+      initialProps: { ...props, editConnection: capped },
+    });
+    expect(result.current.maxBytesBilled).toBe("20971520");
+    rerender({ ...props, editConnection: { ...capped, id: "c2", maxBytesBilled: undefined } });
+    expect(result.current.maxBytesBilled).toBe("");
+    rerender({ ...props, editConnection: { ...capped, id: "c3", maxBytesBilled: null as unknown as number } });
+    expect(result.current.maxBytesBilled).toBe("");
+  });
+
+  test("closing the dialog resets it", () => {
+    const { result, rerender } = renderHook((p) => useConnectionForm(p), {
+      initialProps: { ...props, isOpen: true },
+    });
+    act(() => result.current.setMaxBytesBilled("20971520"));
+    rerender({ ...props, isOpen: false });
+    rerender({ ...props, isOpen: true, editConnection: null });
+    expect(result.current.maxBytesBilled).toBe("");
+    expect(CONNECTION_FORM_DEFAULTS.maxBytesBilled).toBe("");
   });
 });

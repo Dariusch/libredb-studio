@@ -61,6 +61,7 @@ export const CONNECTION_FIELDS: Record<keyof DatabaseConnection, FieldClass> = {
   // nothing; the password sent with it is the secret, classified above.
   warehouse: "public",
   location: "public",
+  maxBytesBilled: "public",
   // The S3 signing region: a region name such as us-east-1, which the server publishes in its own errors. It decides
   // how a request is signed and grants nothing; the secret access key that signs is classified above.
   region: "public",

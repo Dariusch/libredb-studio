@@ -203,6 +203,8 @@ export function ConnectionModal({
     setWarehouse,
     location,
     setLocation,
+    maxBytesBilled,
+    setMaxBytesBilled,
     region,
     setRegion,
     apiPath,
@@ -909,6 +911,29 @@ export function ConnectionModal({
                         className="h-10 bg-panel border-hairline focus:border-brand-tint/50 transition-all text-xs font-mono"
                       />
                       <DeclaredFieldHint config={uiConfig} field="location" />
+                    </div>
+                  )}
+
+                  {takesConnectionField(type, "maxBytesBilled") && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Server strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
+                        <Label htmlFor="maxBytesBilled" className="text-xs font-medium text-fg-muted">
+                          {connectionFieldLabel(uiConfig, "maxBytesBilled", "Max bytes billed")}
+                        </Label>
+                      </div>
+                      <Input
+                        id="maxBytesBilled"
+                        value={maxBytesBilled}
+                        onChange={(e) => setMaxBytesBilled(e.target.value)}
+                        placeholder={connectionFieldPlaceholder(uiConfig, "maxBytesBilled", "")}
+                        inputMode="numeric"
+                        autoComplete="off"
+                        spellCheck={false}
+                        aria-describedby={describedByHint(uiConfig, "maxBytesBilled")}
+                        className="h-10 bg-panel border-hairline focus:border-brand-tint/50 transition-all text-xs font-mono"
+                      />
+                      <DeclaredFieldHint config={uiConfig} field="maxBytesBilled" />
                     </div>
                   )}
 

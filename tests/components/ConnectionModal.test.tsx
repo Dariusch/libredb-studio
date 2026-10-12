@@ -138,6 +138,7 @@ const mockSetReadOnly = mock(() => {});
 const mockSetAllowInsecureAuth = mock(() => {});
 const mockSetDataServers = mock(() => {});
 const mockSetWarehouse = mock(() => {});
+const mockSetMaxBytesBilled = mock(() => {});
 const mockSetApiPath = mock(() => {});
 const mockSetNamespaces = mock(() => {});
 const mockSetTlsServerName = mock(() => {});
@@ -164,6 +165,8 @@ function getDefaultForm() {
     setDataServers: mockSetDataServers,
     warehouse: "",
     setWarehouse: mockSetWarehouse,
+    maxBytesBilled: "",
+    setMaxBytesBilled: mockSetMaxBytesBilled,
     apiPath: "",
     setApiPath: mockSetApiPath,
     namespaces: "",
@@ -601,6 +604,7 @@ describe("ConnectionModal", () => {
     mockSetSaslMechanism.mockClear();
     mockSetReadOnly.mockClear();
     mockSetDataServers.mockClear();
+    mockSetMaxBytesBilled.mockClear();
     mockHandleTestConnection.mockClear();
     mockHandleConnect.mockClear();
   });
@@ -2097,6 +2101,35 @@ describe("ConnectionModal", () => {
       mockDeclaredFields = {};
       rerender(React.createElement(ConnectionModal, createDefaultProps()));
       expect(container.querySelector("#dataServers")).toBeNull();
+    });
+
+    test("draws the Max bytes billed box only for a type that takes the field, labelled and hinted from its declaration", () => {
+      mockFormOverrides = { type: "bigquery", maxBytesBilled: "20971520" };
+      mockDeclaredFields = { bigquery: ["database", "maxBytesBilled"] };
+      mockDeclaredCopy = {
+        fieldLabels: { maxBytesBilled: "Max bytes billed (AI clients)" },
+        fieldHints: { maxBytesBilled: "Declared hint for maxBytesBilled." },
+      };
+      const { container, rerender } = render(React.createElement(ConnectionModal, createDefaultProps()));
+      const box = container.querySelector("#maxBytesBilled") as HTMLInputElement;
+      expect(box.value).toBe("20971520");
+      expect(box.getAttribute("inputmode")).toBe("numeric");
+      expect(box.getAttribute("aria-describedby")).toBe("maxBytesBilled-hint");
+      expect(container.querySelector('label[for="maxBytesBilled"]')?.textContent).toBe("Max bytes billed (AI clients)");
+      fireEvent.change(box, { target: { value: "30000000" } });
+      expect(mockSetMaxBytesBilled).toHaveBeenCalledWith("30000000");
+
+      // With no declared copy the dialog's own words label it and no hint is drawn.
+      mockDeclaredCopy = {};
+      rerender(React.createElement(ConnectionModal, createDefaultProps()));
+      expect(container.querySelector('label[for="maxBytesBilled"]')?.textContent).toBe("Max bytes billed");
+      expect(container.querySelector("#maxBytesBilled")?.getAttribute("aria-describedby")).toBeNull();
+
+      // Another engine draws no such box.
+      mockFormOverrides = { type: "postgres" };
+      mockDeclaredFields = {};
+      rerender(React.createElement(ConnectionModal, createDefaultProps()));
+      expect(container.querySelector("#maxBytesBilled")).toBeNull();
     });
 
     test("draws the Warehouse box for databend only, from its field list, labelled and hinted from its declaration", () => {

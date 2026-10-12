@@ -68,6 +68,25 @@ describe("bigquery createTokenSource", () => {
     });
   });
 
+  test("extra scopes go space-separated into the assertion and comma-separated to the metadata server", async () => {
+    const scopes = [
+      "https://www.googleapis.com/auth/bigquery",
+      "https://www.googleapis.com/auth/cloud-platform.read-only",
+    ];
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      publicKeyEncoding: { type: "spki", format: "pem" },
+    });
+    const sa = fakeTransport([ok("sa-token")]);
+    const creds = { type: "service_account", client_email: "sa@p.iam", private_key: privateKey } as const;
+    await createTokenSource(creds, sa.transport, Date.now, scopes)(signal);
+    expect(decodeJwt(sa.requests[0].form?.assertion ?? "").scope).toBe(scopes.join(" "));
+    const meta = fakeTransport([ok("m")]);
+    await createTokenSource({ type: "metadata", host: "meta" }, meta.transport, Date.now, scopes)(signal);
+    expect(new URL(meta.requests[0].url).searchParams.get("scopes")).toBe(scopes.join(","));
+  });
+
   test("authorized_user posts a refresh_token grant", async () => {
     const { transport, requests } = fakeTransport([ok("user-token")]);
     const creds = { type: "authorized_user", client_id: "id", client_secret: "s", refresh_token: "r" } as const;

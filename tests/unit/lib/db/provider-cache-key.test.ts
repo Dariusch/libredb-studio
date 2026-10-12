@@ -125,11 +125,12 @@ describe("providerCacheKey frames the Databend warehouse a statement runs on", (
   });
 });
 
-describe("providerCacheKey frames the BigQuery location", () => {
-  test("identical connections share a key, and a changed location changes it", async () => {
-    const bq: DatabaseConnection = { ...base, type: "bigquery", location: "EU" };
+describe("providerCacheKey frames the BigQuery location and billed-bytes cap", () => {
+  test("identical connections share a key, and a changed location or cap changes it", async () => {
+    const bq: DatabaseConnection = { ...base, type: "bigquery", location: "EU", maxBytesBilled: 1_073_741_824 };
     expect(await providerCacheKey({ ...bq })).toBe(await providerCacheKey(bq));
     expect(await providerCacheKey({ ...bq, location: "US" })).not.toBe(await providerCacheKey(bq));
+    expect(await providerCacheKey({ ...bq, maxBytesBilled: 10_485_760 })).not.toBe(await providerCacheKey(bq));
   });
 });
 
@@ -234,6 +235,7 @@ describe("providerCacheKey frames every public field that decides who a connecti
     ["dataServers", { ...base, dataServers: "a.internal:6648" }, { ...base, dataServers: "b.internal:6648" }],
     ["warehouse", { ...base, warehouse: "analytics" }, { ...base, warehouse: "etl" }],
     ["location", { ...base, location: "EU" }, { ...base, location: "US" }],
+    ["maxBytesBilled", { ...base, maxBytesBilled: 10_485_760 }, { ...base, maxBytesBilled: 1_073_741_824 }],
     ["region", { ...base, region: "eu-central-1" }, { ...base, region: "us-east-1" }],
     ["namespaces", { ...base, namespaces: "shop" }, { ...base, namespaces: "web" }],
     [

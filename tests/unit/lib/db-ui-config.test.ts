@@ -672,6 +672,7 @@ const FIELD_CHECKLIST: Record<ConnectionField, true> = {
   dataServers: true,
   warehouse: true,
   location: true,
+  maxBytesBilled: true,
   region: true,
   apiPath: true,
   namespaces: true,
@@ -1116,11 +1117,11 @@ describe("declared field rules (Databend design 6.3)", () => {
     );
   });
 
-  test("only databend, s3 and kubernetes declare field rules, so no other engine's Test Connection or Save is checked", () => {
+  test("only databend, bigquery, s3 and kubernetes declare field rules, so no other engine's Test Connection or Save is checked", () => {
     const declaring = Object.entries(DB_UI_CONFIG)
       .filter(([, config]) => config.fieldRules !== undefined)
       .map(([type]) => type);
-    expect(declaring).toEqual(["databend", "s3", "kubernetes"]);
+    expect(declaring).toEqual(["databend", "bigquery", "s3", "kubernetes"]);
     for (const type of ALL_TYPES.filter((candidate) => !declaring.includes(candidate))) {
       expect(
         connectionFieldRefusal(
@@ -1388,6 +1389,33 @@ describe("db-showcase", () => {
         "bigquery",
       ]);
     });
+  });
+
+  test("bigquery takes the billed-bytes cap, labelled for AI clients", () => {
+    expect(takesConnectionField("bigquery", "maxBytesBilled")).toBe(true);
+    expect(takesConnectionField("postgres", "maxBytesBilled")).toBe(false);
+    expect(getDBConfig("bigquery").fieldLabels?.maxBytesBilled).toBe("Max bytes billed (AI clients)");
+    expect(getDBConfig("bigquery").fieldPlaceholders?.maxBytesBilled).toBe("1073741824 (1 GiB)");
+  });
+
+  test("bigquery refuses a cap that is not a whole number of bytes, by name", () => {
+    const config = getDBConfig("bigquery");
+    const refuse = (value: unknown) =>
+      connectionFieldRefusal(config, { maxBytesBilled: value } as unknown as DatabaseConnection);
+    expect(refuse(1073741824)).toBeUndefined();
+    expect(refuse("10MB")).toStartWith("Max bytes billed must be a whole number");
+    expect(refuse("9".repeat(400))).toStartWith("Max bytes billed");
+  });
+
+  test("bigquery refuses a cap below the 10 MiB BigQuery bills at least, which the provider refuses at connect", () => {
+    const config = getDBConfig("bigquery");
+    const refuse = (value: unknown) =>
+      connectionFieldRefusal(config, { maxBytesBilled: value } as unknown as DatabaseConnection);
+    const below = "Max bytes billed must be at least 10485760 (10 MiB), the least BigQuery bills. Nothing was sent.";
+    expect(refuse("5")).toBe(below);
+    expect(refuse(10485759)).toBe(below);
+    expect(refuse(10485760)).toBeUndefined();
+    expect(refuse("10485760")).toBeUndefined();
   });
 
   describe("listShowcaseDatabases", () => {

@@ -14,7 +14,7 @@ import { type NodeTransport, TransportError } from "@/lib/db/http/node-transport
 
 const PROVIDER = "bigquery" as const;
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
-const SCOPE = "https://www.googleapis.com/auth/bigquery";
+export const BIGQUERY_SCOPE = "https://www.googleapis.com/auth/bigquery";
 const REFRESH_EARLY_MS = 60_000;
 /** The shared refresh runs on its own deadline, so no single caller's abort fails the others waiting on it. */
 const REFRESH_TIMEOUT_MS = 30_000;
@@ -111,6 +111,7 @@ export function readCredentials(
 async function grantForm(
   creds: Exclude<GoogleCredentials, { type: "metadata" | "access_token" }>,
   now: number,
+  scopes: readonly string[],
 ): Promise<Record<string, string>> {
   if (creds.type === "authorized_user") {
     return {
@@ -121,7 +122,7 @@ async function grantForm(
     };
   }
   const iat = Math.floor(now / 1000);
-  const assertion = await new SignJWT({ scope: SCOPE })
+  const assertion = await new SignJWT({ scope: scopes.join(" ") })
     .setProtectedHeader({ alg: "RS256", typ: "JWT" })
     .setIssuer(creds.client_email)
     .setAudience(TOKEN_URL)
@@ -143,6 +144,7 @@ export function createTokenSource(
   creds: GoogleCredentials,
   tokens: NodeTransport,
   now: () => number = Date.now,
+  scopes: readonly string[] = [BIGQUERY_SCOPE],
 ): (signal: AbortSignal) => Promise<string> {
   if (creds.type === "access_token") {
     const { token } = creds;
@@ -158,14 +160,14 @@ export function createTokenSource(
       creds.type === "metadata"
         ? await tokens.request({
             method: "GET",
-            url: `http://${creds.host}${METADATA_TOKEN_PATH}?${new URLSearchParams({ scopes: SCOPE })}`,
+            url: `http://${creds.host}${METADATA_TOKEN_PATH}?${new URLSearchParams({ scopes: scopes.join(",") })}`,
             signal,
             maxResponseBytes: TOKEN_RESPONSE_BYTES,
           })
         : await tokens.request({
             method: "POST",
             url: TOKEN_URL,
-            form: await grantForm(creds, now()),
+            form: await grantForm(creds, now(), scopes),
             signal,
             maxResponseBytes: TOKEN_RESPONSE_BYTES,
           });

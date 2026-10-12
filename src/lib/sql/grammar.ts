@@ -235,6 +235,8 @@ export interface SqlGrammar {
    * engine refuses the statement, which it refused before the bound was there too.
    */
   readonly trailingLimitClauses: readonly RegExp[];
+  /** Calls the agent guard refuses because they bill outside its caps; a namespace only as a path's first segment. */
+  readonly agentRefusedCalls?: { readonly words: readonly string[]; readonly namespaces: readonly string[] };
 }
 
 /**
@@ -743,6 +745,8 @@ const BIGQUERY_GRAMMAR: SqlGrammar = {
   // A script (`BEGIN … END`) is sent whole as one job, which the shared splitter does not model.
   script: DEFAULT_SQL_GRAMMAR.script,
   trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
+  // The dry run labels these SELECT, and maximumBytesBilled does not bound them. Remote UDFs are not detected.
+  agentRefusedCalls: { words: ["EXTERNAL_QUERY"], namespaces: ["ML", "AI"] },
 };
 
 /**

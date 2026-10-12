@@ -94,6 +94,8 @@ const FIELD_OWNERSHIP: Record<keyof DatabaseConnection, FieldOwnership> = {
   warehouse: "edited",
   // BigQuery's Location box owns it, so emptying it clears it and detection takes over again.
   location: "edited",
+  // Emptying the box clears it, so the 1 GiB default applies again.
+  maxBytesBilled: "edited",
   // S3's Region box owns it, so emptying it has to CLEAR it, as warehouse.
   region: "edited",
   // Kubernetes' API path, Namespaces and TLS server name boxes own them, so emptying one has to CLEAR it, as warehouse.
@@ -212,6 +214,7 @@ export const CONNECTION_FORM_DEFAULTS = {
   // A leftover warehouse would resume, and bill, the previous connection's compute for the next one.
   warehouse: "",
   location: "",
+  maxBytesBilled: "",
   // A leftover region would sign the next S3 connection's requests for the previous server's region, which it refuses.
   region: "",
   // A leftover API path would send the next Kubernetes connection's requests to another cluster behind the same proxy.
@@ -540,6 +543,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
    */
   const [warehouse, setWarehouse] = useState(D.warehouse);
   const [location, setLocation] = useState(D.location);
+  const [maxBytesBilled, setMaxBytesBilled] = useState(D.maxBytesBilled);
   /**
    * S3's signing region, as typed. Drawn only for an engine that takes the field; stored as typed, spaces included,
    * because the field rule and the provider check it and name the field when they refuse it.
@@ -608,6 +612,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       dataServers: setDataServers,
       warehouse: setWarehouse,
       location: setLocation,
+      maxBytesBilled: setMaxBytesBilled,
       region: setRegion,
       apiPath: setApiPath,
       namespaces: setNamespaces,
@@ -666,6 +671,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       tlsServerName: setTlsServerName,
       location: setLocation,
       amqpPort: setAmqpPort,
+      maxBytesBilled: setMaxBytesBilled,
     }),
     [],
   );
@@ -770,6 +776,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       // edited is saved onto it.
       setWarehouse(editConnection.warehouse ?? "");
       setLocation(editConnection.location ?? "");
+      setMaxBytesBilled(editConnection.maxBytesBilled == null ? "" : String(editConnection.maxBytesBilled));
       // Overwritten for the same reason: a connection that names no region must show an empty box, or the last one
       // edited is saved onto it.
       setRegion(editConnection.region ?? "");
@@ -1005,6 +1012,14 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       // The dataServers rule: only for an engine that takes it, and only when something is typed.
       ...(addressedFields.has("warehouse") && warehouse.trim() !== "" ? { warehouse } : {}),
       ...(addressedFields.has("location") && location.trim() !== "" ? { location: location.trim() } : {}),
+      // Kept as text when not a whole number: Number() gives NaN, which JSON writes as null; the field rule refuses it.
+      ...(addressedFields.has("maxBytesBilled") && maxBytesBilled.trim() !== ""
+        ? {
+            maxBytesBilled: (/^\d{1,15}$/.test(maxBytesBilled.trim())
+              ? Number(maxBytesBilled.trim())
+              : maxBytesBilled.trim()) as number,
+          }
+        : {}),
       // Only for an engine that takes it, and whenever the box is not empty: unlike warehouse, a box of spaces is
       // written so the format rule refuses it, rather than signing for us-east-1 with no word.
       ...(addressedFields.has("region") && region !== "" ? { region } : {}),
@@ -1054,6 +1069,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     dataServers,
     warehouse,
     location,
+    maxBytesBilled,
     region,
     apiPath,
     namespaces,
@@ -1556,6 +1572,8 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     setWarehouse,
     location,
     setLocation,
+    maxBytesBilled,
+    setMaxBytesBilled,
     region,
     setRegion,
     apiPath,

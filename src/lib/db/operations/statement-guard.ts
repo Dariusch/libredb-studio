@@ -57,7 +57,7 @@
  */
 
 import { z } from "zod";
-import { DEFAULT_SQL_GRAMMAR } from "@/lib/sql/grammar";
+import { DEFAULT_SQL_GRAMMAR, type SqlGrammar } from "@/lib/sql/grammar";
 import { readOperativeKeyword } from "@/lib/sql/operative-keyword";
 import { hasUnterminatedSpan, readSqlSpan, type SqlSpanKind } from "@/lib/sql/spans";
 import { readSqlWord } from "@/lib/sql/words";
@@ -218,6 +218,8 @@ const PLAN_EXECUTION_WORDS: ReadonlySet<string> = new Set(["ANALYZE", "ANALYSE"]
 export interface AgentStatementOptions {
   /** true only for the approval-gated plan-execution descriptor (`sql.explain.analyze`). */
   readonly allowPlanExecution?: boolean;
+  /** The connection's dialect; absent means the dialect-less default. It never admits more than the engine does. */
+  readonly grammar?: SqlGrammar;
 }
 
 /**
@@ -247,26 +249,27 @@ function isStatementText(kind: SqlSpanKind): boolean {
  * is why this walks spans rather than splitting on the character. Trailing
  * `;`s, whitespace and comments are not a second statement.
  */
-function scanStatementShape(sql: string): { dialectAmbiguous: boolean; statementTail: boolean } {
+function scanStatementShape(sql: string, grammar: SqlGrammar): { dialectAmbiguous: boolean; statementTail: boolean } {
+  const hashIsAmbiguous = grammar.hash !== "comment";
   let terminated = false;
   let statementTail = false;
   let dialectAmbiguous = false;
   let i = 0;
 
   while (i < sql.length) {
-    const span = readSqlSpan(sql, i, DEFAULT_SQL_GRAMMAR);
+    const span = readSqlSpan(sql, i, grammar);
     if (span !== null) {
       // A `$…$` run read as a literal here is code in SQLite; a `#` run read as
       // a comment here is an operator in PostgreSQL. Either way this reader
       // cannot say where the statement ends, so it says so.
-      if (span.kind === "dollar-string" || sql[i] === "#") dialectAmbiguous = true;
+      if (span.kind === "dollar-string" || (sql[i] === "#" && hashIsAmbiguous)) dialectAmbiguous = true;
       if (terminated && isStatementText(span.kind)) statementTail = true;
       i = span.end;
       continue;
     }
 
     if (sql[i] === ";") terminated = true;
-    else if (sql[i] === "#") dialectAmbiguous = true;
+    else if (sql[i] === "#" && hashIsAmbiguous) dialectAmbiguous = true;
     else if (terminated && !/\s/.test(sql[i])) statementTail = true;
     i++;
   }
@@ -274,12 +277,70 @@ function scanStatementShape(sql: string): { dialectAmbiguous: boolean; statement
   return { dialectAmbiguous, statementTail };
 }
 
+type RefusedCalls = NonNullable<SqlGrammar["agentRefusedCalls"]>;
+
+/** A backtick name is unquoted and split on `.`, because BigQuery resolves `` `ML.DISTANCE` `` to the ML function. */
+function readNameToken(sql: string, i: number, grammar: SqlGrammar): { segments: string[]; end: number } | null {
+  const span = readSqlSpan(sql, i, grammar);
+  if (span !== null) {
+    if (sql[i] !== "`") return null;
+    const name = sql.slice(i + 1, span.end - 1).replace(/\\([\s\S])/g, "$1");
+    return { segments: name.toUpperCase().split("."), end: span.end };
+  }
+  const word = readSqlWord(sql, i);
+  return word === null ? null : { segments: [word.text], end: word.end };
+}
+
+function skipTrivia(sql: string, i: number, grammar: SqlGrammar): number {
+  for (let span = readSqlSpan(sql, i, grammar); span !== null; span = readSqlSpan(sql, i, grammar)) {
+    if (span.kind !== "whitespace" && span.kind !== "line-comment" && span.kind !== "block-comment") break;
+    i = span.end;
+  }
+  return i;
+}
+
+/** A namespace refuses only as the first of several segments (`ml.x`, not `t.ml`); over-refusing an alias is accepted. */
+function readRefusedCall(
+  sql: string,
+  start: number,
+  first: { segments: string[]; end: number },
+  grammar: SqlGrammar,
+  calls: RefusedCalls,
+): { refused: string | null; end: number } {
+  const segments = [...first.segments];
+  let end = first.end;
+  for (;;) {
+    const dot = skipTrivia(sql, end, grammar);
+    if (sql[dot] !== ".") break;
+    const next = readNameToken(sql, skipTrivia(sql, dot + 1, grammar), grammar);
+    if (next === null) break;
+    segments.push(...next.segments);
+    end = next.end;
+  }
+  const word = segments.find((segment) => calls.words.includes(segment));
+  if (word !== undefined) return { refused: word, end };
+  const namespaced = segments.length > 1 && calls.namespaces.includes(segments[0]);
+  return { refused: namespaced ? sql.slice(start, end) : null, end };
+}
+
 /** The first forbidden word in this statement's own code, or null. */
-function findSideEffectWord(sql: string, allowPlanExecution: boolean): string | null {
+function findSideEffectWord(sql: string, allowPlanExecution: boolean, grammar: SqlGrammar): string | null {
+  const calls = grammar.agentRefusedCalls;
+  // `t.ml.x` is one path, not `ml.x`.
+  let pathEnd = 0;
   let i = 0;
 
   while (i < sql.length) {
-    const span = readSqlSpan(sql, i, DEFAULT_SQL_GRAMMAR);
+    if (calls !== undefined && i >= pathEnd) {
+      const token = readNameToken(sql, i, grammar);
+      if (token !== null) {
+        const call = readRefusedCall(sql, i, token, grammar, calls);
+        if (call.refused !== null) return call.refused;
+        pathEnd = call.end;
+      }
+    }
+
+    const span = readSqlSpan(sql, i, grammar);
     if (span !== null) {
       i = span.end;
       continue;
@@ -312,17 +373,18 @@ export function inspectAgentStatement(
   sql: string,
   options: AgentStatementOptions = {},
 ): AgentStatementViolation | null {
-  if (hasUnterminatedSpan(sql, DEFAULT_SQL_GRAMMAR)) return "UNDETERMINABLE_TEXT";
+  const grammar = options.grammar ?? DEFAULT_SQL_GRAMMAR;
+  if (hasUnterminatedSpan(sql, grammar)) return "UNDETERMINABLE_TEXT";
 
-  const shape = scanStatementShape(sql);
+  const shape = scanStatementShape(sql, grammar);
   if (shape.dialectAmbiguous) return "DIALECT_AMBIGUOUS_TEXT";
   if (shape.statementTail) return "MULTIPLE_STATEMENTS";
 
-  const operative = readOperativeKeyword(sql, DEFAULT_SQL_GRAMMAR);
+  const operative = readOperativeKeyword(sql, grammar);
   if (operative === null) return "NO_STATEMENT";
   if (!READ_STATEMENTS.has(operative.keyword)) return "NON_READ_STATEMENT";
 
-  return findSideEffectWord(sql, options.allowPlanExecution === true) === null ? null : "SIDE_EFFECT_KEYWORD";
+  return findSideEffectWord(sql, options.allowPlanExecution === true, grammar) === null ? null : "SIDE_EFFECT_KEYWORD";
 }
 
 /**

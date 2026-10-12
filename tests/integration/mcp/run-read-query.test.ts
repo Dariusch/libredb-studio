@@ -278,7 +278,7 @@ describe("the boundary", () => {
       expect(result.content).toEqual([
         {
           type: "text",
-          text: 'run_read_query cannot run on this connection: Provider type "libredb" has no database-native read-only execution profile. It runs on PostgreSQL, SQLite, DuckDB and SQL Server.',
+          text: 'run_read_query cannot run on this connection: Provider type "libredb" has no database-native read-only execution profile. It runs on PostgreSQL, SQLite, DuckDB, SQL Server and BigQuery.',
         },
       ]);
       expect(writes.calls).toBe(0);
@@ -656,7 +656,7 @@ describe("the registration", () => {
         expect(tool?.annotations).toEqual({ readOnlyHint: true, openWorldHint: false });
         expect(tool?.outputSchema?.type).toBe("object");
         expect(tool?.description).toBe(RUN_READ_QUERY_DESCRIPTION);
-        expect(RUN_READ_QUERY_ENGINES).toBe("PostgreSQL, SQLite, DuckDB and SQL Server");
+        expect(RUN_READ_QUERY_ENGINES).toBe("PostgreSQL, SQLite, DuckDB, SQL Server and BigQuery");
         expect(tool?.description).toContain(`Runs on ${RUN_READ_QUERY_ENGINES};`);
       } finally {
         await session.close();

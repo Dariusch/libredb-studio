@@ -504,6 +504,17 @@ describe("SeedConnectionSchema: Db2's consent to a cleartext password (#786)", (
     expect(result.error?.issues.map((issue) => issue.path)).toEqual([["warehouse"]]);
   });
 
+  it("maxBytesBilled survives parsing as an integer of at least 10 MiB", () => {
+    const ok = SeedConnectionSchema.safeParse({ ...db2, maxBytesBilled: 10_485_760 });
+    expect(ok.success).toBe(true);
+    expect(ok.data?.maxBytesBilled).toBe(10_485_760);
+    for (const bad of [10_485_759, 20_000_000.5, "1073741824"]) {
+      const result = SeedConnectionSchema.safeParse({ ...db2, maxBytesBilled: bad });
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map((issue) => issue.path)).toEqual([["maxBytesBilled"]]);
+    }
+  });
+
   // The schema has no type gate on this field either: `db2` is only a valid seed to carry it.
   it("region survives parsing (zod strips an undeclared key)", () => {
     const result = SeedConnectionSchema.safeParse({ ...db2, region: "eu-central-1" });

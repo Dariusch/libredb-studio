@@ -36,6 +36,7 @@
  * approval-gated `sql.explain.analyze` descriptor alone may turn into an executing one.
  */
 
+import { quoteIdentifier } from "@/lib/sql/identifier";
 import { quoteLiteral } from "@/lib/sql/values";
 import type { ReadOnlyStatementMode } from "@/lib/db/types";
 import type { DatabaseType } from "@/lib/types";
@@ -52,8 +53,8 @@ export interface AgentEstimatingExplain {
 export type AgentComposedSqlDenyCode =
   /**
    * This dialect has no verified composition. `CATALOG_COMPOSERS` is the list, and it
-   * is the four engines of `AGENT_EXECUTION_ENGINES`: PostgreSQL, SQLite, DuckDB and
-   * SQL Server. Anything else is refused rather than served a statement nobody ran
+   * is the five engines of `AGENT_EXECUTION_ENGINES`: PostgreSQL, SQLite, DuckDB,
+   * SQL Server and BigQuery. Anything else is refused rather than served a statement nobody ran
    * against that engine's catalog.
    */
   | "UNSUPPORTED_DIALECT"
@@ -949,6 +950,58 @@ function composeMssqlStatistics(selector: AgentCatalogSelector): string {
   );
 }
 
+// ─── BigQuery (GoogleSQL) ─────────────────────────────────────────────────
+
+/** Catalog reads are per dataset; the region form needs a location a selector lacks, so no dataset is refused. */
+function bigqueryDataset(selector: AgentCatalogSelector): string {
+  if (selector.schema === undefined) {
+    throw new AgentComposedSqlError(
+      "a BigQuery catalog read is per dataset: name the dataset as the schema selector",
+      "SELECTOR_UNSUPPORTED_BY_DIALECT",
+    );
+  }
+  return quoteIdentifier(assertSelector(selector.schema, "schema"), "bigquery");
+}
+
+function composeBigqueryCatalog(selector: AgentCatalogSelector): string {
+  return (
+    "SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position " +
+    `FROM ${bigqueryDataset(selector)}.INFORMATION_SCHEMA.COLUMNS WHERE true` +
+    equalsClause("table_name", selector.table, "table", "bigquery") +
+    " ORDER BY table_name, ordinal_position"
+  );
+}
+
+/** BigQuery declares no enforced foreign keys the agent reads, so the object read serves both kinds (as on SQLite). */
+function composeBigqueryRelations(selector: AgentCatalogSelector): string {
+  return (
+    "SELECT table_schema, table_name, table_type " +
+    `FROM ${bigqueryDataset(selector)}.INFORMATION_SCHEMA.TABLES WHERE true` +
+    equalsClause("table_name", selector.table, "table", "bigquery") +
+    " ORDER BY table_name"
+  );
+}
+
+/** Search indexes are BigQuery's only index objects. */
+function composeBigqueryIndexes(selector: AgentCatalogSelector): string {
+  return (
+    "SELECT index_schema AS table_schema, table_name, index_name, index_status " +
+    `FROM ${bigqueryDataset(selector)}.INFORMATION_SCHEMA.SEARCH_INDEXES WHERE true` +
+    equalsClause("table_name", selector.table, "table", "bigquery") +
+    " ORDER BY table_name, index_name"
+  );
+}
+
+/** `__TABLES__` carries the row count and byte size without scanning a table. */
+function composeBigqueryStatistics(selector: AgentCatalogSelector): string {
+  return (
+    "SELECT dataset_id AS table_schema, table_id AS table_name, row_count AS estimated_rows, size_bytes " +
+    `FROM ${bigqueryDataset(selector)}.__TABLES__ WHERE true` +
+    equalsClause("table_id", selector.table, "table", "bigquery") +
+    " ORDER BY table_id"
+  );
+}
+
 /**
  * Per dialect, per kind. SQLite's relation read IS its object read: foreign keys
  * are declared inside `CREATE TABLE` and the only structured alternative
@@ -960,7 +1013,7 @@ function composeMssqlStatistics(selector: AgentCatalogSelector): string {
  * and demands all four kinds plus an estimating plan for each name in it. The invariant was
  * asserted in this docblock long before anything enforced it, and it named the wrong file:
  * `engine-support.test.ts` compares the engine list against the DRIVERS and has never read
- * this map, so a fourth engine could have been added to the list with no composer and every
+ * this map, so a further engine could have been added to the list with no composer and every
  * gate would have passed. An engine that
  * reaches the factory's read-only gate but no composer is an engine on which
  * `inspect_schema`, `profile_table` and `inspect_plan` can only ever refuse — which is
@@ -994,6 +1047,12 @@ const CATALOG_COMPOSERS: Partial<
     relations: composeMssqlRelations,
     indexes: composeMssqlIndexes,
     statistics: composeMssqlStatistics,
+  },
+  bigquery: {
+    columns: composeBigqueryCatalog,
+    relations: composeBigqueryRelations,
+    indexes: composeBigqueryIndexes,
+    statistics: composeBigqueryStatistics,
   },
 };
 
@@ -1045,7 +1104,9 @@ const ESTIMATING_EXPLAIN_PREFIX: Partial<Record<DatabaseType, string>> = {
  * The engines whose estimating plan is a SESSION MODE rather than a statement prefix,
  * and which therefore compose no prefix at all.
  *
- * SQL Server is the only one, and it is not an oversight of its dialect: T-SQL has no
+ * SQL Server and BigQuery. BigQuery's estimate is a dry run the provider performs for
+ * `mode: "estimate-plan"` (one row of statement type and bytes processed, nothing run);
+ * SQL Server's is described below and it is not an oversight of its dialect: T-SQL has no
  * `EXPLAIN` keyword. Its estimating plan is `SET SHOWPLAN_ALL ON`, which must be the
  * only statement in its batch and has to be turned off again on the SAME connection,
  * neither of which a prefix can say. So the statement travels unchanged and the MODE
@@ -1056,7 +1117,7 @@ const ESTIMATING_EXPLAIN_PREFIX: Partial<Record<DatabaseType, string>> = {
  * refusal below still means what it says: a dialect absent from BOTH is a dialect whose
  * estimating plan nobody has verified, and it is refused rather than guessed at.
  */
-const ESTIMATING_EXPLAIN_SESSION_MODE: ReadonlySet<DatabaseType> = new Set<DatabaseType>(["mssql"]);
+const ESTIMATING_EXPLAIN_SESSION_MODE: ReadonlySet<DatabaseType> = new Set<DatabaseType>(["mssql", "bigquery"]);
 
 /**
  * The catalog statement for this dialect and selector.

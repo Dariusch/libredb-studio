@@ -26,7 +26,8 @@ mock.module("@/lib/db/http/node-transport", () => ({
           entry.fail.push(reject);
           req.signal?.addEventListener("abort", () => reject(new TransportError("aborted", "cancelled")));
           Promise.resolve(
-            new URL(req.url).pathname.startsWith("/bigquery/v2/")
+            new URL(req.url).pathname.startsWith("/bigquery/v2/") ||
+              new URL(req.url).pathname.endsWith(":testIamPermissions")
               ? api(req)
               : { status: 200, text: JSON.stringify({ access_token: `t${++tokenCount}`, expires_in: tokenTtl }) },
           ).then(resolve, reject);
@@ -155,6 +156,43 @@ describe("bigquery query", () => {
     expect(lane?.opts.headers).toEqual({ authorization: "Bearer t1" });
   });
 
+  test("maximumBytesBilled goes out as a string, and is absent when unset", async () => {
+    api = () => json({ jobComplete: true });
+    const bq = createBigQueryTransport("p", creds);
+    await bq.query("SELECT 1", { ...opts, maximumBytesBilled: 10485760 });
+    await bq.query("SELECT 1", opts);
+    const [a, b] = apiCalls();
+    expect(JSON.parse(a.body ?? "").maximumBytesBilled).toBe("10485760");
+    expect(JSON.parse(b.body ?? "")).not.toHaveProperty("maximumBytesBilled");
+  });
+
+  test("dryRunStatement posts jobs.insert with dryRun and reads the statement type", async () => {
+    api = () => json({ statistics: { query: { statementType: "INSERT", totalBytesProcessed: "4096" } } });
+    const bq = createBigQueryTransport("my-proj", creds);
+    const r = await bq.dryRunStatement("INSERT x", { location: "EU", defaultDataset: "ds", signal });
+    expect(r).toEqual({ statementType: "INSERT", totalBytesProcessed: 4096 });
+    const [req] = apiCalls();
+    expect(req.method).toBe("POST");
+    expect(req.url).toBe("https://bigquery.googleapis.com/bigquery/v2/projects/my-proj/jobs");
+    expect(JSON.parse(req.body ?? "")).toEqual({
+      configuration: {
+        dryRun: true,
+        query: { query: "INSERT x", useLegacySql: false, defaultDataset: { projectId: "my-proj", datasetId: "ds" } },
+      },
+      jobReference: { projectId: "my-proj", location: "EU" },
+    });
+  });
+
+  test("dryRunStatement without statistics is UNKNOWN with no byte count, and sends no location or dataset", async () => {
+    api = () => json({});
+    const r = await createBigQueryTransport("p", creds).dryRunStatement("SELECT 1", { signal });
+    expect(r).toEqual({ statementType: "UNKNOWN", totalBytesProcessed: null });
+    expect(JSON.parse(apiCalls()[0].body ?? "")).toEqual({
+      configuration: { dryRun: true, query: { query: "SELECT 1", useLegacySql: false } },
+      jobReference: { projectId: "p" },
+    });
+  });
+
   test("a bare answer has no rows, no schema and null totals", async () => {
     api = () => json({ rows: "nope", totalBytesProcessed: "x" });
     const result = await createBigQueryTransport("p", creds).query("SELECT 1", opts);
@@ -276,6 +314,48 @@ describe("bigquery job cancel", () => {
       .query("SELECT 1", opts)
       .catch(() => {});
     expect(cancels()).toHaveLength(0);
+  });
+});
+
+describe("bigquery permission check", () => {
+  const crm = "cloudresourcemanager.googleapis.com";
+
+  test("asks Resource Manager on its own TLS transport with the bearer, answers what is held, and closes it", async () => {
+    api = (req) => {
+      expect(JSON.parse(req.body ?? "{}")).toEqual({ permissions: ["a.b.c", "d.e.f"] });
+      return json({ permissions: ["d.e.f", 7] });
+    };
+    const transport = createBigQueryTransport("my-proj", creds);
+    expect(await transport.testPermissions(["a.b.c", "d.e.f"], signal)).toEqual(["d.e.f"]);
+    const lane = built.find((b) => b.opts.origin.host === crm)!;
+    expect(lane.opts).toMatchObject({
+      origin: { scheme: "https", host: crm, port: 443 },
+      tls: { rejectUnauthorized: true, identity: crm },
+      headers: { authorization: "Bearer t1" },
+    });
+    expect(lane.requests[0]).toMatchObject({
+      method: "POST",
+      url: `https://${crm}/v1/projects/my-proj:testIamPermissions`,
+    });
+    expect(lane.closed).toBe(1);
+  });
+
+  test("an answer holding nothing is an empty list, and a refusal is a BigQueryApiError", async () => {
+    api = () => json({});
+    const transport = createBigQueryTransport("p", creds);
+    expect(await transport.testPermissions(["a.b.c"], signal)).toEqual([]);
+    api = () => json({ error: { message: "no scope", errors: [{ reason: "insufficientScopes" }] } }, 403);
+    const error = await transport.testPermissions(["a.b.c"], signal).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(BigQueryApiError);
+    expect(error).toMatchObject({ status: 403, reason: "insufficientScopes", message: "no scope" });
+    expect(built.filter((b) => b.opts.origin.host === crm).every((b) => b.closed === 1)).toBe(true);
+  });
+
+  test("the scopes it is built with reach the token request", async () => {
+    api = () => json({ permissions: [] });
+    const scopes = ["s1", "s2"];
+    await createBigQueryTransport("p", { type: "metadata", host: "meta" }, {}, scopes).testPermissions([], signal);
+    expect(new URL(built[0].requests[0].url).searchParams.get("scopes")).toBe("s1,s2");
   });
 });
 

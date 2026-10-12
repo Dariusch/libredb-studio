@@ -10,7 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { createVerify, generateKeyPairSync } from "node:crypto";
-import { AuthenticationError, QueryError, TimeoutError } from "@/lib/db/errors";
+import { AuthenticationError, ExecutionProfileError, QueryError, TimeoutError } from "@/lib/db/errors";
 import type { NodeRequest, NodeResponse, NodeTransportOptions } from "@/lib/db/http/node-transport";
 import { BIGQUERY_DRY_RUN_MARKER } from "@/lib/explain/bigquery-dryrun";
 import type { DatabaseConnection } from "@/lib/types";
@@ -52,6 +52,7 @@ const CLIENT_EMAIL = "studio@demo-project.iam.gserviceaccount.com";
 const KEY_JSON = JSON.stringify({ type: "service_account", client_email: CLIENT_EMAIL, private_key: privateKey });
 
 const API = "https://bigquery.googleapis.com/bigquery/v2/projects/demo-project";
+const GIB = 1024 ** 3;
 
 const ORDER_COLUMNS: Col[] = [
   { name: "order_id", type: "INT64", mode: "REQUIRED" },
@@ -133,11 +134,20 @@ class FakeGoogle {
   informationSchema = true;
   tokenReply: Reply | null = null;
   datasetsReply: Reply | null = null;
+  dryRunReply: Reply | null = null;
+  /** What Resource Manager reports the caller holds on the project. */
+  heldPermissions: string[] = [];
+  permissionsReply: Reply | null = null;
+  tokenScopes: string[] = [];
   tokensIssued = 0;
   closed = 0;
   /** A test's own answer for a jobs.query / GET getQueryResults; return undefined to fall through. */
   onQuery: (sql: string, body: Wire) => Reply | undefined = () => undefined;
   onPoll: (jobId: string, params: URLSearchParams) => Reply | undefined = () => undefined;
+  statementType = (sql: string): string => {
+    const head = sql.trim().split(/\s+/)[0].toUpperCase();
+    return ["INSERT", "DELETE", "CREATE", "DECLARE"].includes(head) ? (head === "DECLARE" ? "SCRIPT" : head) : "SELECT";
+  };
 
   create(options: NodeTransportOptions) {
     const authorization = options.headers.authorization;
@@ -163,11 +173,26 @@ class FakeGoogle {
     const path = url.pathname.replace("/bigquery/v2/projects/demo-project", "");
     const body = request.body ? (JSON.parse(request.body) as Wire) : null;
     this.requests.push({ method: request.method, path, params: url.searchParams, body, authorization });
+    if (
+      url.host === "cloudresourcemanager.googleapis.com" &&
+      url.pathname === "/v1/projects/demo-project:testIamPermissions"
+    ) {
+      if (this.permissionsReply) return this.permissionsReply;
+      const asked = (body?.permissions ?? []) as string[];
+      return ok({ permissions: asked.filter((name) => this.heldPermissions.includes(name)) });
+    }
     if (url.host !== "bigquery.googleapis.com" || !url.pathname.startsWith("/bigquery/v2/projects/demo-project")) {
       return apiError(404, "no such route", "notFound");
     }
 
     if (request.method === "POST" && path === "/queries") return this.jobsQuery(body!);
+    if (request.method === "POST" && path === "/jobs") {
+      if (this.dryRunReply) return this.dryRunReply;
+      const sql = String(((body!.configuration as Wire).query as Wire).query);
+      return ok({
+        statistics: { query: { statementType: this.statementType(sql), totalBytesProcessed: "4096" } },
+      });
+    }
     if (request.method === "POST" && /^\/jobs\/[^/]+\/cancel$/.test(path)) return ok({ job: {} });
     const poll = /^\/queries\/([^/]+)$/.exec(path);
     if (request.method === "GET" && poll) {
@@ -208,7 +233,8 @@ class FakeGoogle {
       .verify(publicKey, signature, "base64url");
     expect(verified).toBe(true);
     const claims = JSON.parse(Buffer.from(payload, "base64url").toString()) as Wire;
-    expect(claims).toMatchObject({ iss: CLIENT_EMAIL, scope: "https://www.googleapis.com/auth/bigquery" });
+    expect(claims).toMatchObject({ iss: CLIENT_EMAIL });
+    this.tokenScopes.push(String(claims.scope));
     this.tokensIssued += 1;
     return ok({ access_token: `ya29.fake-token-${this.tokensIssued}`, expires_in: 3600 });
   }
@@ -306,6 +332,7 @@ mock.module("@/lib/db/http/node-transport", () => ({
   createNodeTransport: (options: NodeTransportOptions) => google.create(options),
 }));
 const { BigQueryProvider } = await import("@/lib/db/providers/sql/bigquery");
+const { resolveConnection } = await import("@/lib/seed/resolve-connection");
 
 // ============================================================================
 // Harness
@@ -323,14 +350,15 @@ const connection = (over: Partial<DatabaseConnection> = {}): DatabaseConnection 
   }) as DatabaseConnection;
 
 const opened: InstanceType<typeof BigQueryProvider>[] = [];
-async function open(over: Partial<DatabaseConnection> = {}) {
-  const provider = new BigQueryProvider(connection(over));
+async function open(over: Partial<DatabaseConnection> = {}, readOnly = false) {
+  const provider = new BigQueryProvider(connection(over), {}, readOnly ? { readOnly: true } : {});
   opened.push(provider);
   await provider.connect();
   return provider;
 }
 const posted = (path: string) => google.requests.filter((r) => r.method === "POST" && r.path === path);
 const queriesWith = (needle: RegExp) => posted("/queries").filter((r) => needle.test(String(r.body?.query)));
+const budget = { statementTimeoutMs: 30_000, maxResultRows: 100, maxResultBytes: 100_000 };
 
 beforeEach(() => {
   google = new FakeGoogle();
@@ -758,5 +786,160 @@ describe("monitoring", () => {
     expect(await provider.getActiveSessions()).toEqual([]);
     expect(await provider.getTableStats()).toEqual([]);
     expect(await provider.getStorageStats()).toEqual([]);
+  });
+});
+
+// ============================================================================
+// The AI client path
+// ============================================================================
+
+describe("queryReadOnly", () => {
+  const selectRows = (rows: number) =>
+    ok({
+      jobComplete: true,
+      schema: { fields: [{ name: "order_id", type: "INT64" }] },
+      rows: stringRows(Array.from({ length: rows }, (_, i) => [String(i + 1)])),
+      totalBytesProcessed: "1024",
+      totalBytesBilled: "10485760",
+    });
+  const answerSelect = (rows: number) => {
+    google.onQuery = (sql) => (sql.startsWith("SELECT order_id") ? selectRows(rows) : undefined);
+  };
+  const run = "SELECT order_id FROM shop.orders";
+  const executed = () => queriesWith(/^SELECT order_id/);
+
+  test("opening under the profile checks the identity's project permissions with a read-only platform token", async () => {
+    await open({}, true);
+    const check = google.requests.filter((r) => r.path.endsWith(":testIamPermissions"));
+    expect(check).toHaveLength(1);
+    expect(check[0].authorization).toBe("Bearer ya29.fake-token-1");
+    expect(check[0].body!.permissions).toContain("bigquery.tables.updateData");
+    expect(google.tokenScopes).toEqual([
+      "https://www.googleapis.com/auth/bigquery https://www.googleapis.com/auth/cloud-platform.read-only",
+    ]);
+    await open();
+    expect(google.tokenScopes[1]).toBe("https://www.googleapis.com/auth/bigquery");
+    expect(google.requests.filter((r) => r.path.endsWith(":testIamPermissions"))).toHaveLength(1);
+  });
+
+  test("an identity that can write, or one whose permissions cannot be read, is refused at open", async () => {
+    google.heldPermissions = ["bigquery.tables.updateData", "bigquery.jobs.create"];
+    const writer = await open({}, true).catch((error: unknown) => error);
+    expect(writer).toBeInstanceOf(ExecutionProfileError);
+    expect((writer as Error).message).toContain("holds bigquery.tables.updateData on project demo-project");
+    google.permissionsReply = apiError(403, "Cloud Resource Manager API has not been used", "accessNotConfigured");
+    const unverified = await open({}, true).catch((error: unknown) => error);
+    expect(unverified).toBeInstanceOf(ExecutionProfileError);
+    expect((unverified as Error).message).toContain("Cloud Resource Manager API has not been used");
+  });
+
+  test("dry-runs, then runs a SELECT with the default 1 GiB billed-bytes cap", async () => {
+    answerSelect(2);
+    const provider = await open({ schema: "shop" }, true);
+    const result = await provider.queryReadOnly(run, budget);
+
+    const dry = posted("/jobs")[0].body as { configuration: { dryRun: boolean; query: Wire }; jobReference: Wire };
+    expect(dry.configuration).toMatchObject({
+      dryRun: true,
+      query: { query: run, defaultDataset: { projectId: "demo-project", datasetId: "shop" } },
+    });
+    expect(dry.jobReference).toEqual({ projectId: "demo-project", location: "EU" });
+    expect(executed()[0].body).toMatchObject({
+      maximumBytesBilled: String(GIB),
+      location: "EU",
+      dryRun: false,
+      maxResults: 101,
+    });
+    expect(result.rows).toEqual([{ order_id: "1" }, { order_id: "2" }]);
+    expect(result.columnTypes).toEqual({ order_id: "INT64" });
+    expect(result.warnings?.[0].message).toBe("Processed 1 KB, billed 10 MB");
+  });
+
+  test("the cap is the configured value, clamped to 1 GiB unless the connection is managed", async () => {
+    answerSelect(1);
+    const capOf = async (over: Partial<DatabaseConnection>) => {
+      google.requests.length = 0;
+      await (await open(over, true)).queryReadOnly(run, budget);
+      return executed()[0].body!.maximumBytesBilled;
+    };
+    expect(await capOf({ maxBytesBilled: 50 * 1024 * 1024 })).toBe(String(50 * 1024 * 1024));
+    expect(await capOf({ maxBytesBilled: 5 * GIB })).toBe(String(GIB));
+    expect(await capOf({ maxBytesBilled: 5 * GIB, managed: true })).toBe(String(5 * GIB));
+  });
+
+  test("an inline connection claiming managed is clamped to 1 GiB once resolved", async () => {
+    answerSelect(1);
+    const inline = await resolveConnection(
+      { connection: connection({ managed: true, maxBytesBilled: 5 * GIB }) },
+      { role: "user", username: "someone" },
+    );
+    const provider = new BigQueryProvider(inline, {}, { readOnly: true });
+    opened.push(provider);
+    await provider.connect();
+    await provider.queryReadOnly(run, budget);
+    expect(executed()[0].body!.maximumBytesBilled).toBe(String(GIB));
+  });
+
+  test.each([
+    ["NON_READ_STATEMENT", "INSERT INTO shop.orders (order_id) VALUES (1)"],
+    ["MULTIPLE_STATEMENTS", "DECLARE x INT64; SELECT x"],
+    ["SIDE_EFFECT_KEYWORD", "SELECT * FROM ML.PREDICT(MODEL shop.churn, TABLE shop.customers)"],
+    ["SIDE_EFFECT_KEYWORD", "SELECT * FROM EXTERNAL_QUERY('demo-project.eu.pg', 'SELECT 1')"],
+  ])("refuses %s before any dry run: %s", async (violation, sql) => {
+    const provider = await open({}, true);
+    const failure = await provider.queryReadOnly(sql, budget).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(QueryError);
+    expect((failure as Error).message).toContain(violation);
+    expect(posted("/jobs")).toHaveLength(0);
+  });
+
+  test("refuses a statement BigQuery classifies as other than SELECT without executing it", async () => {
+    google.statementType = () => "SCRIPT";
+    const provider = await open({}, true);
+    const failure = await provider.queryReadOnly(run, budget).catch((error: unknown) => error);
+    expect((failure as Error).message).toContain("classifies it as SCRIPT, not SELECT");
+    expect(executed()).toHaveLength(0);
+    expect(posted("/jobs")).toHaveLength(1);
+  });
+
+  test("estimate-plan answers the dry-run row and never executes", async () => {
+    const provider = await open({}, true);
+    const result = await provider.queryReadOnly(run, budget, "estimate-plan");
+    expect(result.rows).toEqual([{ statement_type: "SELECT", bytes_processed: 4096, bytes_processed_human: "4 KB" }]);
+    expect(result.fields).toEqual(["statement_type", "bytes_processed", "bytes_processed_human"]);
+    expect(executed()).toHaveLength(0);
+  });
+
+  test("refuses a result over the row budget and over the byte budget", async () => {
+    const provider = await open({}, true);
+    answerSelect(3);
+    await expect(provider.queryReadOnly(run, { ...budget, maxResultRows: 2 })).rejects.toThrow(
+      /exceeded the row budget: more than 2 rows/,
+    );
+    expect(executed().at(-1)!.body).toMatchObject({ maxResults: 3 });
+    await expect(provider.queryReadOnly(run, { ...budget, maxResultBytes: 10 })).rejects.toThrow(
+      /exceeded the byte budget/,
+    );
+  });
+
+  test("a failing dry run is mapped like any other BigQuery error", async () => {
+    const provider = await open({}, true);
+    google.dryRunReply = apiError(400, "Syntax error: Unrecognized name: nope", "invalidQuery");
+    const failure = await provider.queryReadOnly("SELECT nope", budget).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(QueryError);
+    expect((failure as Error).message).toContain("Unrecognized name");
+  });
+
+  test("query() is refused on a read-only provider, and queryReadOnly on one that is not", async () => {
+    const readOnly = await open({}, true);
+    const before = google.requests.length;
+    await expect(readOnly.query("SELECT 1")).rejects.toThrow(/queryReadOnly only/);
+    expect(google.requests).toHaveLength(before);
+
+    const writable = await open();
+    await expect(writable.queryReadOnly(run, budget)).rejects.toThrow(
+      /requires a provider opened under the agent read-only profile/,
+    );
+    expect(posted("/jobs")).toHaveLength(0);
   });
 });

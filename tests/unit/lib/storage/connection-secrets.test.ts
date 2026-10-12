@@ -144,6 +144,8 @@ describe("the classification is exhaustive by construction", () => {
         "warehouse",
         // BigQuery's job location: a region name, which grants nothing, so `public`.
         "location",
+        // BigQuery's billed-bytes cap for AI clients: a number, which grants nothing, so `public`.
+        "maxBytesBilled",
         // Kubernetes' API path, namespace list and TLS server name: where requests go and what the tree draws, so
         // `public`; the token and the client key that authenticate them are classified as secrets.
         "apiPath",

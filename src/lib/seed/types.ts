@@ -188,6 +188,8 @@ export const SeedConnectionSchema = z
     warehouse: z.string().optional(),
     // BigQuery only: the job location; absent, the provider detects it.
     location: z.string().optional(),
+    // BigQuery only: AI-client billed-bytes cap; at least 10 MiB, BigQuery's minimum billing.
+    maxBytesBilled: z.number().int().min(10_485_760).optional(),
     // S3-compatible object storage only: the signing region. Declared for the reason skipObjectScan is: zod strips an
     // undeclared key silently, and a seeded connection to a server with a region of its own would be refused for a
     // region the file did name.

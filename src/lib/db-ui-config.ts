@@ -80,6 +80,8 @@ export interface DatabaseUIConfig {
     | "warehouse"
     // BigQuery only: the job location, one text box; empty means detected.
     | "location"
+    // BigQuery only: AI-client billed-bytes cap; empty means 1 GiB.
+    | "maxBytesBilled"
     // S3-compatible object storage only: the signing region, one text box.
     | "region"
     // Kubernetes only: the server path prefix (Rancher's /k8s/clusters/<id>), the namespaces the tree lists, and the
@@ -174,6 +176,8 @@ export interface ConnectionFieldRule {
   readonly format?: { readonly pattern: RegExp; readonly sentence: string };
   /** A field that is not blank and passes `format` must hold `min` to `max` characters, or `sentence` is the refusal. */
   readonly charRange?: { readonly min: number; readonly max: number; readonly sentence: string };
+  /** A non-blank field that passes `format` must be a number of at least `value`. */
+  readonly minimum?: { readonly value: number; readonly sentence: string };
 }
 
 /**
@@ -819,20 +823,36 @@ export const DB_UI_CONFIG: Record<DatabaseType, DatabaseUIConfig> = {
     label: "BigQuery",
     defaultPort: "",
     showConnectionStringToggle: false,
-    connectionFields: ["database", "schema", "password", "location"],
+    connectionFields: ["database", "schema", "password", "location", "maxBytesBilled"],
     fieldLabels: {
       database: "Project ID",
       schema: "Default dataset",
       password: "Service-account key JSON or access token",
       location: "Location",
+      maxBytesBilled: "Max bytes billed (AI clients)",
     },
     // Always HTTPS to googleapis.com with the system trust store, and a tunnel would forward one address of
     // several (the API, the token endpoint, the metadata server), so neither panel would be read.
     showSshTunnel: false,
     showSslPanel: false,
+    fieldRules: {
+      maxBytesBilled: {
+        format: {
+          pattern: /^\d{1,15}$/,
+          sentence:
+            "Max bytes billed must be a whole number of bytes (at most 15 digits), e.g. 1073741824 for 1 GiB. Nothing was sent.",
+        },
+        // The provider's MIN_BYTES_BILLED, which it refuses below at connect.
+        minimum: {
+          value: 10 * 1024 * 1024,
+          sentence: "Max bytes billed must be at least 10485760 (10 MiB), the least BigQuery bills. Nothing was sent.",
+        },
+      },
+    },
     fieldPlaceholders: {
       database: "my-gcp-project",
       location: "detected (e.g. EU, US, europe-west3)",
+      maxBytesBilled: "1073741824 (1 GiB)",
       password: "key JSON, a ya29… token, or empty for server credentials (if enabled)",
     },
   },
@@ -1076,6 +1096,7 @@ export function connectionFieldRefusal(config: DatabaseUIConfig, connection: Dat
     ) {
       return rule.charRange.sentence;
     }
+    if (rule.minimum !== undefined && !(Number(value) >= rule.minimum.value)) return rule.minimum.sentence;
   }
   return undefined;
 }
