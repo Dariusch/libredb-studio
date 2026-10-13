@@ -322,10 +322,13 @@ describe("query", () => {
   test("no warning without processed bytes; DML affected rows; no location", async () => {
     fake.datasets = [];
     const provider = await connected();
-    fake.onQuery = async () => result({ affectedRows: 7 });
+    // BigQuery sends the table's schema with a DML answer.
+    fake.onQuery = async () => result({ affectedRows: 7, fields: [{ name: "id", type: "INTEGER" }] });
     const r = await provider.query("DELETE FROM t WHERE true");
     expect(fake.calls.at(-1)?.options.location).toBeUndefined();
     expect(r.rowCount).toBe(7);
+    expect(r.fields).toEqual([]);
+    expect(r.columnTypes).toBeUndefined();
     expect(r.warnings).toBeUndefined();
   });
 
@@ -758,6 +761,12 @@ describe("monitoring", () => {
     expect(cache.size).toBe(1);
     await provider.disconnect();
     expect(cache.size).toBe(0);
+  });
+
+  test("a project with no tables reads 0 B, not N/A", async () => {
+    const provider = await connected();
+    fake.onQuery = async () => result({ rows: [] });
+    expect(await provider.getOverview()).toMatchObject({ databaseSize: "0 B", databaseSizeBytes: 0, tableCount: 0 });
   });
 
   test("no location: everything empty", async () => {
