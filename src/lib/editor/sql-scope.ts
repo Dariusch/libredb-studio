@@ -140,7 +140,7 @@ function readItem(
   let end: number;
   if (text[pos] === "(") {
     const close = closeOf(sql, at);
-    // ponytail: past MAX_DEPTH a subquery is opaque, which bounds the work on pathological nesting.
+    // Past MAX_DEPTH a subquery is opaque, which bounds the work on pathological nesting.
     if (depth < MAX_DEPTH && /^\s*(?:SELECT|WITH)\b/i.test(sql.slice(at + 1, close))) {
       source = { at, depth, derived: derive(sql, at + 1, close, ctes, depth + 1) };
     } else if (keyword === "USING") {
