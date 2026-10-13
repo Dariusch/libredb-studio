@@ -81,6 +81,51 @@ describe("statementScope", () => {
     expect(names(derived.derived!.sources)).toEqual(["users"]);
   });
 
+  test("a cast before an implicit alias leaves the alias its name", () => {
+    const [derived] = scopeAt(
+      'SELECT | FROM (SELECT id::int total, u.name::double precision, "a::b"::text FROM users u) s',
+    ).sources;
+    expect(derived.derived!.columns).toEqual(["total", "name", "a::b"]);
+  });
+
+  test("an empty entry of a column list names nothing", () => {
+    expect(scopeAt("SELECT | FROM users AS s(a, ").sources[0].derived!.columns).toEqual(["a"]);
+    expect(scopeAt("WITH c () AS (SELECT id FROM users) SELECT | FROM c").sources[0].derived!.columns).toEqual([]);
+  });
+
+  test("DISTINCT ON keeps the star after it", () => {
+    const [derived] = scopeAt("SELECT | FROM (SELECT DISTINCT ON (u.id) * FROM users u) s").sources;
+    expect(derived.derived!.star).toBe(true);
+  });
+
+  test("an ON that names an object is a source, a join's or an upsert's is not", () => {
+    expect(names(scopeAt("CREATE INDEX i ON users (|").sources)).toEqual(["users"]);
+    expect(names(scopeAt("GRANT SELECT ON TABLE users TO r|").sources)).toEqual(["users"]);
+    expect(names(scopeAt("CREATE TRIGGER t AFTER UPDATE ON users FOR EACH ROW|").sources)).toEqual(["users"]);
+    expect(names(scopeAt("SELECT | FROM a JOIN b ON x = y").sources)).toEqual(["a", "b"]);
+    expect(names(scopeAt("INSERT INTO t (a) VALUES (1) ON CONFLICT (|").sources)).toEqual(["t"]);
+    expect(names(scopeAt("SELECT DISTINCT ON (x) | FROM a").sources)).toEqual(["a"]);
+  });
+
+  test("a subquery nested past the depth cap is opaque", () => {
+    const sql = `SELECT | FROM ${"(SELECT * FROM ".repeat(40)}users${") s".repeat(40)}`;
+    let source = scopeAt(sql).sources[0];
+    let depth = 0;
+    while (source.derived) {
+      source = source.derived.sources[0];
+      depth++;
+    }
+    expect(source.opaque).toBe(true);
+    expect(depth).toBe(32);
+  });
+
+  test("a cast keeps its operand's name", () => {
+    const [derived] = scopeAt(
+      "SELECT | FROM (SELECT id::text, u.name::varchar(10), total::int AS t FROM users u) s",
+    ).sources;
+    expect(derived.derived!.columns).toEqual(["id", "name", "t"]);
+  });
+
   test("a CTE yields its select list, or its declared columns, and is named in the scope", () => {
     const scope = scopeAt(
       "WITH c AS (SELECT id, email FROM users), d (x, y) AS MATERIALIZED (SELECT 1, 2) SELECT | FROM c JOIN d",

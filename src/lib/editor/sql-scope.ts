@@ -33,10 +33,11 @@ export interface StatementScope {
   readonly ctes: readonly string[];
 }
 
+const MAX_DEPTH = 32;
 const SEG = '`[^`]+`|"(?:[^"]|"")+"|\\[[^\\]]+\\]|[\\w$]+(?:-[\\w$]+)*';
 const NAME = `(?:${SEG})(?:\\.(?:${SEG}))*`;
 const KEYWORD =
-  /^(?:ON|USING|WHERE|JOIN|INNER|LEFT|RIGHT|FULL|CROSS|NATURAL|OUTER|SET|VALUES|GROUP|ORDER|HAVING|LIMIT|OFFSET|FETCH|UNION|INTERSECT|EXCEPT|WINDOW|QUALIFY|SELECT|FROM|AS|DEFAULT|RETURNING|TABLESAMPLE|FOR|WITH|LATERAL|PIVOT|UNPIVOT|WHEN|THEN|ELSE|END|AND|OR|NOT|FINAL|PREWHERE|SAMPLE|FORCE|USE|IGNORE|PARTITION|APPLY|START|CONNECT|MATCH_RECOGNIZE|IS|NULL|TRUE|FALSE|LIKE|ILIKE|IN|BETWEEN|DISTINCT|BY|ASC|DESC|CASE|COLLATE|ESCAPE)$/i;
+  /^(?:ON|USING|WHERE|JOIN|INNER|LEFT|RIGHT|FULL|CROSS|NATURAL|OUTER|SET|VALUES|GROUP|ORDER|HAVING|LIMIT|OFFSET|FETCH|UNION|INTERSECT|EXCEPT|WINDOW|QUALIFY|SELECT|FROM|AS|DEFAULT|RETURNING|TABLESAMPLE|FOR|WITH|LATERAL|PIVOT|UNPIVOT|WHEN|THEN|ELSE|END|AND|OR|NOT|FINAL|PREWHERE|SAMPLE|FORCE|USE|IGNORE|PARTITION|APPLY|START|CONNECT|MATCH_RECOGNIZE|IS|NULL|TRUE|FALSE|LIKE|ILIKE|IN|BETWEEN|DISTINCT|BY|ASC|DESC|CASE|COLLATE|ESCAPE|TO)$/i;
 
 function unquote(segment: string): string {
   if (segment.startsWith('"')) return segment.slice(1, -1).replace(/""/g, '"');
@@ -73,10 +74,23 @@ function flat(sql: string, start: number, end: number): string {
   return out;
 }
 
+/** A PostgreSQL cast that ends an item: `::text`, `::varchar(10)`, `::double precision`, `::int[]`. */
+const CAST = /::[\w$]+(?:\s+(?:precision|varying|(?:with|without)\s+time\s+zone))?(?:\s*\([\d\s,]*\))?(?:\[\])*$/i;
+
+/** The names of the column list whose `(` is at `open`; an empty entry (`s(a, `, `c ()`) names nothing. */
+function columnList(sql: string, open: number): string[] {
+  return sql
+    .slice(open + 1, closeOf(sql, open))
+    .split(",")
+    .flatMap((c) => segments(c.trim()).slice(0, 1));
+}
+
 /** The name a select-list item yields: its alias, or a bare column's own name. An expression yields none. */
 function itemName(item: string): string | undefined {
   const explicit =
-    new RegExp(`\\bAS\\s+(${SEG})$`, "i").exec(item)?.[1] ?? new RegExp(`^(?:(?:${SEG})\\.)*(${SEG})$`).exec(item)?.[1];
+    new RegExp(`\\bAS\\s+(${SEG})$`, "i").exec(item)?.[1] ??
+    // A cast keeps its operand's name: `id::text` is `id`.
+    new RegExp(`^(?:(?:${SEG})\\.)*(${SEG})$`).exec(item.replace(CAST, ""))?.[1];
   // An implicit alias follows an expression's last token, never an operator word (`a AND b`, `x IS NULL`).
   const implicit = new RegExp(`(${SEG}|\\))\\s+(${SEG})$`).exec(item);
   const name = explicit ?? (implicit && !KEYWORD.test(implicit[1]) ? implicit[2] : undefined);
@@ -91,7 +105,7 @@ function derive(sql: string, start: number, end: number, outer: Map<string, Deri
   const branch = text.search(/\b(?:UNION|INTERSECT|EXCEPT)\b/i);
   const stop = branch < 0 ? text.length : branch;
   const first = text.slice(0, stop);
-  const select = /\bSELECT\s+(?:(?:DISTINCT|ALL)\s+)?/i.exec(first);
+  const select = /\bSELECT\s+(?:DISTINCT\s+ON\s*\(\s*\)\s*|(?:DISTINCT|ALL)\s+)?/i.exec(first);
   const columns: string[] = [];
   let star = false;
   if (select) {
@@ -118,7 +132,7 @@ function readItem(
   ctes: Map<string, DerivedSource>,
   depth: number,
 ): { source: ScopeSource; end: number } | undefined {
-  const prefix = /(?:LATERAL|ONLY)\s+/iy;
+  const prefix = /(?:LATERAL|ONLY|TABLE)\s+/iy;
   prefix.lastIndex = pos;
   if (prefix.test(text)) pos = prefix.lastIndex;
   const at = base + pos;
@@ -126,7 +140,8 @@ function readItem(
   let end: number;
   if (text[pos] === "(") {
     const close = closeOf(sql, at);
-    if (/^\s*(?:SELECT|WITH)\b/i.test(sql.slice(at + 1, close))) {
+    // ponytail: past MAX_DEPTH a subquery is opaque, which bounds the work on pathological nesting.
+    if (depth < MAX_DEPTH && /^\s*(?:SELECT|WITH)\b/i.test(sql.slice(at + 1, close))) {
       source = { at, depth, derived: derive(sql, at + 1, close, ctes, depth + 1) };
     } else if (keyword === "USING") {
       return undefined; // `JOIN b USING (col)`: a column list, no source
@@ -140,8 +155,8 @@ function readItem(
     end = name.lastIndex;
     const call = /\s*\(/y;
     call.lastIndex = end;
-    // After INTO or UPDATE a `(` opens the column list; elsewhere it calls a table function.
-    if (keyword !== "INTO" && keyword !== "UPDATE" && call.test(text)) {
+    // After INTO, UPDATE or an object's ON a `(` opens the column list; elsewhere it calls a table function.
+    if (keyword !== "INTO" && keyword !== "UPDATE" && keyword !== "ON" && call.test(text)) {
       end = closeOf(sql, base + call.lastIndex - 1) + 1 - base;
       source = { at, depth, opaque: true };
     } else {
@@ -161,10 +176,7 @@ function readItem(
     list.lastIndex = end;
     if (list.test(text)) {
       const close = closeOf(sql, base + list.lastIndex - 1);
-      const columns = sql
-        .slice(base + list.lastIndex, close)
-        .split(",")
-        .map((c) => segments(c.trim())[0]);
+      const columns = columnList(sql, base + list.lastIndex - 1);
       const derived = { columns, star: false, sources: source.derived?.sources ?? [] };
       source = { at, depth, alias: source.alias, ...(source.name ? { name: source.name } : {}), derived };
       end = close + 1 - base;
@@ -177,8 +189,15 @@ function readItem(
 function sourcesIn(sql: string, start: number, end: number, ctes: Map<string, DerivedSource>, depth: number) {
   const text = flat(sql, start, end);
   const sources: ScopeSource[] = [];
-  for (const match of text.matchAll(/\b(FROM|JOIN|INTO|(?<!\b(?:ON|FOR|KEY)\s+)UPDATE|USING)\s+/gi)) {
+  let previous: string | undefined;
+  for (const match of text.matchAll(
+    /(?<![\w$.])(FROM|JOIN|INTO|(?<!\b(?:ON|FOR|KEY)\s+)UPDATE|USING|(?<!\bDISTINCT\s+)ON)\s+/gi,
+  )) {
     const keyword = match[1].toUpperCase();
+    const before = previous;
+    previous = keyword;
+    // Only an ON that names an object (`CREATE INDEX i ON t`, `GRANT … ON t`, `… AFTER UPDATE ON t`) is a source.
+    if (keyword === "ON" && (depth > 0 || (before !== undefined && before !== "UPDATE"))) continue;
     let pos = match.index + match[0].length;
     for (;;) {
       const item = readItem(sql, text, start, pos, keyword, ctes, depth);
@@ -203,7 +222,7 @@ function readCtes(sql: string, start: number, end: number, outer: ReadonlyMap<st
   const names: string[] = [];
   const bodies: number[] = [];
   const text = flat(sql, start, end);
-  const definition = new RegExp(`(${SEG})\\s*(\\(\\s*\\))?\\s*AS\\s+(?:NOT\\s+)?(?:MATERIALIZED\\s+)?\\(`, "iy");
+  const definition = new RegExp(`(${SEG})\\s*(?:(\\(\\s*\\))\\s*)?AS\\s+(?:NOT\\s+)?(?:MATERIALIZED\\s+)?\\(`, "iy");
   for (const head of text.matchAll(/\bWITH\s+(?:RECURSIVE\s+)?/gi)) {
     definition.lastIndex = head.index + head[0].length;
     for (let match = definition.exec(text); match; match = definition.exec(text)) {
@@ -212,8 +231,7 @@ function readCtes(sql: string, start: number, end: number, outer: ReadonlyMap<st
       let derived: DerivedSource = derive(sql, open + 1, close, ctes, depth + 1);
       if (match[2]) {
         const list = start + text.indexOf("(", match.index + match[1].length);
-        const declared = sql.slice(list + 1, closeOf(sql, list)).split(",");
-        derived = { ...derived, columns: declared.map((c) => segments(c.trim())[0]), star: false };
+        derived = { ...derived, columns: columnList(sql, list), star: false };
       }
       const name = segments(match[1])[0];
       ctes.set(name.toLowerCase(), derived);

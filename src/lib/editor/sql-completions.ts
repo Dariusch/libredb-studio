@@ -244,7 +244,7 @@ function qualifierOf(source: ScopeSource): string | undefined {
  */
 function columnsOfSource(cache: SchemaCompletionCache, source: ScopeSource): SchemaColumnItem[] | undefined {
   if (source.opaque) return undefined;
-  if (!source.derived) return columnsOfReference(cache, source.name!);
+  if (!source.derived) return source.name && columnsOfReference(cache, source.name);
   const { known, complete } = innerColumns(cache, source.derived);
   const tableName = source.name?.join(".") ?? source.alias ?? "subquery";
   const named = source.derived.columns.map((label) => {
@@ -306,17 +306,29 @@ function openGroupStart(text: string, end: number): number {
 function lastClause(textBeforeCursor: string): { name: string; rest: string } | undefined {
   const matches = [
     ...textBeforeCursor.matchAll(
-      /\b(SELECT|FROM|JOIN|WHERE|ON|SET|HAVING|ORDER\s+BY|GROUP\s+BY|INTO|(?<!\b(?:ON|FOR|KEY)\s+)UPDATE|TABLE|LIMIT|USING)\b/gi,
+      // Not a qualified name's segment (`t.table`), and `DISTINCT ON` is an expression list.
+      /(?<![\w$.])(SELECT|FROM|JOIN|WHERE|(?<!\bDISTINCT\s+)ON|SET|HAVING|ORDER\s+BY|GROUP\s+BY|INTO|(?<!\b(?:ON|FOR|KEY)\s+)UPDATE|TABLE|LIMIT|USING)\b/gi,
     ),
   ];
-  for (const match of matches.reverse()) {
+  // A clause keyword that governs the text from it to `end`: not inside a group that closed before.
+  const governs = (match: RegExpMatchArray, end: number) =>
+    !leavesGroup(textBeforeCursor.slice(match.index! + match[0].length, end));
+  matches.reverse();
+  for (const [i, match] of matches.entries()) {
     // A FROM inside a call (`EXTRACT(YEAR FROM`, `TRIM(BOTH FROM`) is an argument, unless its group opens a query.
     if (/^FROM$/i.test(match[1])) {
       const group = openGroupStart(textBeforeCursor, match.index);
       if (group > 0 && !/\b(?:SELECT|DELETE)\b/i.test(textBeforeCursor.slice(group, match.index))) continue;
     }
     const rest = textBeforeCursor.slice(match.index + match[0].length);
-    if (!leavesGroup(rest)) return { name: match[1].toUpperCase().replace(/\s+/g, " "), rest };
+    if (leavesGroup(rest)) continue;
+    // A statement-level ON after no clause, SELECT or UPDATE names an object (`CREATE INDEX i ON`,
+    // `GRANT SELECT ON`, `AFTER UPDATE ON`): a table position. A join's, an `ON CONFLICT`'s or a key's is not.
+    if (/^ON$/i.test(match[1]) && /^\s*[\w$.]*$/.test(rest) && openGroupStart(textBeforeCursor, match.index) === 0) {
+      const previous = matches.slice(i + 1).find((m) => governs(m, match.index!));
+      if (!previous || /^(?:SELECT|UPDATE)$/i.test(previous[1])) return { name: "TABLE", rest };
+    }
+    return { name: match[1].toUpperCase().replace(/\s+/g, " "), rest };
   }
   return undefined;
 }
@@ -326,15 +338,15 @@ const LITERAL_KINDS: ReadonlySet<SqlSpanKind> = new Set([...COMMENT_KINDS, "quot
 
 /** `sql` with the spans of these kinds overwritten by spaces, so offsets still line up with the original. */
 function blankSpans(sql: string, grammar: SqlGrammar, kinds: ReadonlySet<SqlSpanKind>): string {
-  let out = "";
+  const out: string[] = [];
   let i = 0;
   while (i < sql.length) {
     const span = readSqlSpan(sql, i, grammar);
     const end = span?.end ?? i + 1;
-    out += span && kinds.has(span.kind) ? " ".repeat(end - i) : sql.slice(i, end);
+    out.push(span && kinds.has(span.kind) ? " ".repeat(end - i) : sql.slice(i, end));
     i = end;
   }
-  return out;
+  return out.join("");
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +366,7 @@ export function registerSQLCompletionProvider(
   databaseType?: DatabaseType,
 ): Monaco.IDisposable {
   const grammar = resolveSqlGrammar(databaseType);
+  const blanked = new WeakMap<Monaco.editor.ITextModel, { version: number; code: string }>();
   return monaco.languages.registerCompletionItemProvider("sql", {
     triggerCharacters: [".", " "],
     provideCompletionItems: (model: Monaco.editor.ITextModel, position: Monaco.Position) => {
@@ -386,6 +399,8 @@ export function registerSQLCompletionProvider(
           : quoteSegment === undefined
             ? segment
             : quoteSegment(segment);
+      // A statement's own name is read unquoted; one that needed quotes gets them back.
+      const asWritten = (name: string) => (/^[A-Za-z_][\w$]*$/.test(name) ? name : formatSegment(name));
       const tableItem = (table: SchemaTableItem, insertText: string, tableRange: Monaco.IRange) => ({
         // It still filters on the table's own name.
         ...(table.labelQualified && insertText.includes(".") && insertText !== table.label
@@ -442,10 +457,17 @@ export function registerSQLCompletionProvider(
               );
 
       // Read with literals and comments blanked: a `;`, a paren or a keyword written in one is no code.
+      // Blanked once per model version: a trigger and the filtering requests after it share it.
       const text = model.getValue();
       const offset = model.getOffsetAt(position);
-      const code = blankSpans(text, grammar, LITERAL_KINDS);
-      const start = code.lastIndexOf(";", offset - 1) + 1;
+      const version = model.getVersionId();
+      let memo = blanked.get(model);
+      if (memo?.version !== version) {
+        memo = { version, code: blankSpans(text, grammar, LITERAL_KINDS) };
+        blanked.set(model, memo);
+      }
+      const code = memo.code;
+      const start = offset > 0 ? code.lastIndexOf(";", offset - 1) + 1 : 0;
       const terminator = code.indexOf(";", offset);
       const scope = statementScope(
         blankSpans(text.slice(start, terminator < 0 ? undefined : terminator), grammar, COMMENT_KINDS),
@@ -490,14 +512,11 @@ export function registerSQLCompletionProvider(
           if (!columns) {
             // The whole statement around the cursor, not only the text before it: in
             // `SELECT c. FROM e2e.customers c` the alias is defined AFTER the cursor, and a
-            // read that stopped at the cursor offered nothing there (#1397). The text before
-            // is everything up to the dot, as it always was; the text after runs to the
-            // statement's terminator, so a later statement's aliases are not read.
-            const text = model.getValue();
-            const offset = model.getOffsetAt(position);
+            // read that stopped at the cursor offered nothing there (#1397). It runs from the
+            // statement's start to its terminator, so another statement's aliases are not read.
             const after = text.slice(offset);
             const terminator = after.indexOf(";");
-            const statement = `${text.slice(0, offset - 1)} ${terminator < 0 ? after : after.slice(0, terminator)}`;
+            const statement = `${text.slice(start, offset - 1)} ${terminator < 0 ? after : after.slice(0, terminator)}`;
 
             const { aliases } = extractAliases(statement);
             const resolvedTableName = resolveAlias(identifier, aliases);
@@ -579,15 +598,16 @@ export function registerSQLCompletionProvider(
         }
       });
 
-      // Tables and the statement's CTEs, except where only a column can stand
-      if (!isColumnContext) {
+      // Tables and the statement's CTEs, except where only a column can stand. A SELECT list that names
+      // no source yet still offers them: typed left to right, nothing else reaches a table there.
+      if (!isColumnContext || (clause?.name === "SELECT" && scope.sources.length === 0)) {
         suggestions.push(...tableSuggestions);
         for (const cte of scope.ctes) {
           if (!shouldFilter || cte.toLowerCase().startsWith(prefix)) {
             suggestions.push({
               label: cte,
               kind: monaco.languages.CompletionItemKind.Class,
-              insertText: cte,
+              insertText: asWritten(cte),
               range,
               detail: "CTE",
               sortText: "2" + cte,
@@ -610,8 +630,9 @@ export function registerSQLCompletionProvider(
           }
           resolved.push({ source, columns });
         }
+        const inScope = resolved.length > 0;
         // `JOIN b USING (`: only a column the joined source shares with an earlier one of its query.
-        if (clause?.name === "USING" && resolved.length > 0) {
+        if (clause?.name === "USING" && inScope) {
           const level = resolved.filter(
             (r) => r.source.depth === resolved[0].source.depth && r.source.at < offset - start,
           );
@@ -627,12 +648,11 @@ export function registerSQLCompletionProvider(
         for (const { source, columns } of resolved) {
           const owner = source.name?.join(".") ?? source.alias ?? "subquery";
           for (const col of columns) {
-            const entry = scoped.get(col.label);
-            if (!entry) scoped.set(col.label, { col, owners: [owner] });
+            const entry = scoped.get(col.labelLower);
+            if (!entry) scoped.set(col.labelLower, { col, owners: [owner] });
             else if (!entry.owners.includes(owner)) entry.owners.push(owner);
           }
         }
-        const inScope = resolved.length > 0;
         const columnEntries = inScope
           ? [...scoped.values()]
           : [...schemaCompletionCache.allColumns.values()].map((col) => ({ col, owners: [] as string[] }));
@@ -660,13 +680,13 @@ export function registerSQLCompletionProvider(
           suggestions.push({
             label: qualifier,
             kind: monaco.languages.CompletionItemKind.Variable,
-            insertText: qualifier,
+            insertText: asWritten(qualifier),
             range,
             detail: source.alias
               ? `Alias of ${source.name?.join(".") ?? "subquery"}`
               : source.derived
                 ? "CTE"
-                : `Source ${source.name!.join(".")}`,
+                : `Source ${source.name?.join(".")}`,
             sortText: "01" + qualifier,
           });
         }

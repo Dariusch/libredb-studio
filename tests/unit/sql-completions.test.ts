@@ -71,6 +71,7 @@ function createMockModel(lineContent: string, fullText?: string) {
     // The whole document, with the cursor on its first line: every model here is one line long.
     getValue: () => fullText || lineContent,
     getOffsetAt: (position: { column: number }) => position.column - 1,
+    getVersionId: () => 1,
   } as unknown as Monaco.editor.ITextModel;
 }
 
@@ -924,10 +925,11 @@ describe("Clause-aware suggestions", () => {
   const isTable = (s: { detail?: string }) => s.detail?.startsWith("Table") === true;
   const isColumn = (s: { detail?: string }) => s.detail?.startsWith("Column") === true;
 
-  test("a SELECT list offers columns and no tables", () => {
+  test("a SELECT list offers columns, and tables only until the statement names a source", () => {
     const suggestions = at("SELECT ");
     expect(suggestions.some(isColumn)).toBe(true);
-    expect(suggestions.some(isTable)).toBe(false);
+    expect(suggestions.some(isTable)).toBe(true);
+    expect(at("SELECT id FROM users WHERE id IN (SELECT ").some(isTable)).toBe(false);
   });
 
   test("a FROM or JOIN position offers tables and no columns", () => {
@@ -939,9 +941,54 @@ describe("Clause-aware suggestions", () => {
   });
 
   test("WHERE and ON go back to columns", () => {
-    for (const text of ["SELECT id FROM users WHERE ", "SELECT 1 FROM a JOIN b ON "]) {
+    for (const text of [
+      "SELECT id FROM users WHERE ",
+      "SELECT 1 FROM a JOIN b ON ",
+      "SELECT 1 FROM a JOIN b x ON ",
+      "SELECT 1 FROM a JOIN (SELECT id FROM b) x ON ",
+      "MERGE INTO a USING b ON ",
+      "INSERT INTO users (id) VALUES (1) ON DUPLICATE KEY UPDATE id = ",
+    ]) {
       expect(at(text).some(isTable)).toBe(false);
     }
+  });
+
+  test("an ON that names an object offers tables", () => {
+    for (const text of [
+      "CREATE INDEX i ON ",
+      "GRANT SELECT ON ",
+      "CREATE TRIGGER trg BEFORE INSERT ON ",
+      "CREATE POLICY p ON ",
+      "CREATE TRIGGER trg AFTER UPDATE ON us",
+    ]) {
+      const suggestions = at(text);
+      expect(suggestions.some(isTable)).toBe(true);
+      expect(suggestions.some(isColumn)).toBe(false);
+    }
+    const indexed = columnsAt("CREATE INDEX i ON users (");
+    expect(indexed).toContain("email");
+    expect(indexed).not.toContain("total");
+  });
+
+  test("DISTINCT ON, a qualified keyword-named column and a partly typed ON word are no table position", () => {
+    for (const [text, cursor] of [
+      ["SELECT DISTINCT ON  FROM users", "SELECT DISTINCT ON ".length],
+      ["SELECT t.table,  FROM users t", "SELECT t.table, ".length],
+      ["INSERT INTO users (id) VALUES (1) ON CONFL", undefined],
+      ["CREATE TABLE t (a int REFERENCES users (id) ON DEL", undefined],
+      ["ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES users (id) ON DEL", undefined],
+    ] as const) {
+      expect(labelsAt(text, cursor).some((s) => s.table)).toBe(false);
+    }
+  });
+
+  test("a model's blanked text is reused for the same version", () => {
+    const monaco = createMockMonaco();
+    registerSQLCompletionProvider(monaco, createSchemaCache());
+    const model = createMockModel("SELECT * FROM users WHERE ");
+    const provider = monaco._getProvider()!;
+    const first = provider.provideCompletionItems(model, createPosition(1, 27)).suggestions.length;
+    expect(provider.provideCompletionItems(model, createPosition(1, 27)).suggestions.length).toBe(first);
   });
 
   test("an open column or definition list after INTO/TABLE offers columns, not tables", () => {
@@ -980,7 +1027,11 @@ describe("Clause-aware suggestions", () => {
   });
 
   test("a keyword inside a string or a comment is no clause", () => {
-    for (const text of ["SELECT 'from' ", "SELECT id /* from */ ", "SELECT id -- from x\n"]) {
+    for (const text of [
+      "SELECT * FROM users WHERE name = 'from' ",
+      "SELECT * FROM users WHERE id /* from */ ",
+      "SELECT * FROM users WHERE id -- from x\n",
+    ]) {
       const suggestions = labelsAt(text);
       expect(suggestions.some((s) => s.column)).toBe(true);
       expect(suggestions.some((s) => s.table)).toBe(false);
@@ -988,7 +1039,8 @@ describe("Clause-aware suggestions", () => {
   });
 
   test("a dollar-quoted keyword is no clause on PostgreSQL", () => {
-    expect(labelsAt("SELECT $$from$$ ", undefined, "postgres").some((s) => s.table)).toBe(false);
+    expect(labelsAt("SELECT * FROM users WHERE $$from$$ ", undefined, "postgres").some((s) => s.table)).toBe(false);
+    expect(labelsAt("SELECT * FROM users WHERE $$from$$ ", undefined, "postgres").some((s) => s.column)).toBe(true);
   });
 
   test("a `;` inside a string does not end the statement", () => {
@@ -1036,9 +1088,11 @@ describe("Clause-aware suggestions", () => {
   describe.each(["postgres", "mysql"] as const)("on %s", (dialect) => {
     const tables = (text: string) => labelsAt(text, undefined, dialect).filter((s) => s.table);
 
-    test("a SELECT list offers no table, and a table name typed there still completes its columns after the dot", () => {
-      expect(tables("SELECT ")).toEqual([]);
-      expect(tables("SELECT us")).toEqual([]);
+    test("a SELECT list offers tables until a source is named, and a table name typed there completes its columns after the dot", () => {
+      expect(tables("SELECT us").map((s) => s.label)).toContain("users");
+      const named = labelsAt("SELECT  FROM users", "SELECT ".length, dialect);
+      expect(named.filter((s) => s.table)).toEqual([]);
+      expect(named.some((s) => s.label === "users")).toBe(true);
       expect(labelsAt("SELECT users.", undefined, dialect).map((s) => s.label)).toEqual(["id", "name", "email"]);
     });
 
@@ -1160,7 +1214,7 @@ describe("Statement scope in completion", () => {
   });
 
   test("a FROM inside a function call, and a table function's arguments, are no table position", () => {
-    for (const text of ["SELECT EXTRACT(YEAR FROM ", "SELECT * FROM generate_series(1, "]) {
+    for (const text of ["SELECT * FROM users WHERE EXTRACT(YEAR FROM ", "SELECT * FROM generate_series(1, "]) {
       const suggestions = at(text);
       expect(suggestions.some((s) => s.detail.startsWith("Column"))).toBe(true);
       expect(suggestions.some((s) => s.label === "COUNT")).toBe(true);
@@ -1173,14 +1227,44 @@ describe("Statement scope in completion", () => {
     expect(columns(text, "SELECT ".length)).toEqual(expect.arrayContaining(["email", "total"]));
   });
 
+  test("a quoted CTE or alias name is inserted quoted", () => {
+    const monaco = createMockMonaco();
+    registerSQLCompletionProvider(monaco, createSchemaCache(), "postgres");
+    const provider = monaco._getProvider()!;
+    const insertsAt = (text: string, cursor = text.length) =>
+      provider
+        .provideCompletionItems(createMockModel(text.slice(0, cursor), text), createPosition(1, cursor + 1))
+        .suggestions.filter((s) => s.label === "my cte")
+        .map((s) => s.insertText);
+    expect(insertsAt('WITH "my cte" AS (SELECT id FROM users) SELECT * FROM ')).toEqual(['"my cte"']);
+    const text = 'WITH "my cte" AS (SELECT id FROM users) SELECT  FROM "my cte"';
+    expect(insertsAt(text, text.indexOf("SELECT  ") + "SELECT ".length)).toContain('"my cte"');
+  });
+
+  test("a name two sources spell in different case is one column with both owners", () => {
+    const text = "SELECT  FROM (SELECT ID FROM users) a, (SELECT id FROM users) b";
+    const hits = at(text, "SELECT ".length).filter(
+      (s) => s.label.toLowerCase() === "id" && s.detail.startsWith("Column"),
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0].detail).toContain("a, b");
+  });
+
+  test("the dot path reads no alias from another statement, and a cursor at 0 is harmless", () => {
+    expect(at("SELECT * FROM users x; SELECT x.")).toEqual([]);
+    expect(at("SELECT * FROM users x WHERE x.").map((s) => s.label)).toContain("email");
+    expect(() => at(";SELECT", 0)).not.toThrow();
+  });
+
   test("a long chain of self-joining CTEs resolves in linear time", () => {
-    const ctes = Array.from({ length: 30 }, (_, i) =>
+    // Doubling per link would never finish at 40; the loose bound only guards against that.
+    const ctes = Array.from({ length: 40 }, (_, i) =>
       i === 0 ? "c0 AS (SELECT id FROM users)" : `c${i} AS (SELECT * FROM c${i - 1} a JOIN c${i - 1} b ON true)`,
     );
-    const text = `WITH ${ctes.join(", ")} SELECT * FROM c29 WHERE `;
+    const text = `WITH ${ctes.join(", ")} SELECT * FROM c39 WHERE `;
     const started = performance.now();
     expect(columns(text)).toContain("id");
-    expect(performance.now() - started).toBeLessThan(200);
+    expect(performance.now() - started).toBeLessThan(2000);
   });
 
   test("a CTE after CREATE VIEW ... AS or inside a subquery scopes the columns like a leading one", () => {

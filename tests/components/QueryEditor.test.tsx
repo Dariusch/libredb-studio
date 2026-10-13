@@ -3395,19 +3395,25 @@ describe("QueryEditor completion addresses (#1397)", () => {
     function columnMap(props: Partial<Parameters<typeof QueryEditor>[0]>) {
       mockUseMonacoReturn = { Range: class {} };
       mockRegisterSQLCompletionProvider.mockClear();
-      const { unmount } = render(React.createElement(QueryEditor, createDefaultProps(props)));
-      const calls = mockRegisterSQLCompletionProvider.mock.calls as unknown as [unknown, SchemaCompletionCache][];
-      const map = calls[calls.length - 1][1].columnMap;
-      unmount();
-      mockUseMonacoReturn = null;
-      return map;
+      try {
+        const { unmount } = render(React.createElement(QueryEditor, createDefaultProps(props)));
+        const calls = mockRegisterSQLCompletionProvider.mock.calls as unknown as [unknown, SchemaCompletionCache][];
+        unmount();
+        return calls[calls.length - 1][1].columnMap;
+      } finally {
+        mockUseMonacoReturn = null;
+      }
     }
 
-    test("goes to the default container's table even when listed first", () => {
+    test("goes to the default container's table even when listed after another", () => {
       const map = columnMap({ schemaContext: dup, defaultContainer: ["archive"] });
       expect(map.get("orders")![0].label).toBe("old_id");
       expect(map.get("sales.orders")![0].label).toBe("sale_id");
       expect(map.get("archive.orders")![0].label).toBe("old_id");
+    });
+
+    test("keeps the default container's table when another is listed after it", () => {
+      expect(columnMap({ schemaContext: dup, defaultContainer: ["sales"] }).get("orders")![0].label).toBe("sale_id");
     });
 
     test("with no default the first listed wins", () => {
