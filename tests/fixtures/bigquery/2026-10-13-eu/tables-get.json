@@ -41,9 +41,9 @@
           "numBytes": "280",
           "numLongTermBytes": "0",
           "numRows": "7",
-          "creationTime": "1791795113815",
-          "expirationTime": "1791881513815",
-          "lastModifiedTime": "1791795115432",
+          "creationTime": "1791876479702",
+          "expirationTime": "1791962879702",
+          "lastModifiedTime": "1791876481360",
           "type": "TABLE",
           "location": "EU",
           "numTotalLogicalBytes": "280",
@@ -103,9 +103,9 @@
           "numBytes": "63",
           "numLongTermBytes": "0",
           "numRows": "2",
-          "creationTime": "1791795114146",
-          "expirationTime": "1791881514146",
-          "lastModifiedTime": "1791795116560",
+          "creationTime": "1791876480035",
+          "expirationTime": "1791962880035",
+          "lastModifiedTime": "1791876483661",
           "type": "TABLE",
           "location": "EU",
           "numTotalLogicalBytes": "63",
@@ -145,9 +145,9 @@
           "numBytes": "0",
           "numLongTermBytes": "0",
           "numRows": "0",
-          "creationTime": "1791795116981",
-          "expirationTime": "1791881516981",
-          "lastModifiedTime": "1791795116981",
+          "creationTime": "1791876484088",
+          "expirationTime": "1791962884088",
+          "lastModifiedTime": "1791876484088",
           "type": "VIEW",
           "view": {
             "query": "SELECT customer_id, SUM(total) AS spent FROM shop.orders GROUP BY customer_id",
@@ -188,12 +188,12 @@
               }
             ]
           },
-          "numBytes": "0",
+          "numBytes": "168",
           "numLongTermBytes": "0",
-          "numRows": "0",
-          "creationTime": "1791795117387",
-          "expirationTime": "1791881517387",
-          "lastModifiedTime": "1791795117387",
+          "numRows": "7",
+          "creationTime": "1791876484504",
+          "expirationTime": "1791962884504",
+          "lastModifiedTime": "1791876486253",
           "type": "MATERIALIZED_VIEW",
           "location": "EU",
           "materializedView": {
@@ -201,8 +201,8 @@
             "enableRefresh": true,
             "refreshIntervalMs": "1800000"
           },
-          "numTotalLogicalBytes": "0",
-          "numActiveLogicalBytes": "0",
+          "numTotalLogicalBytes": "168",
+          "numActiveLogicalBytes": "168",
           "numLongTermLogicalBytes": "0",
           "materializedViewStatus": {}
         }
@@ -245,16 +245,16 @@
               }
             ]
           },
-          "numBytes": "0",
+          "numBytes": "40",
           "numLongTermBytes": "0",
-          "numRows": "0",
-          "creationTime": "1791795114425",
-          "expirationTime": "1791881514425",
-          "lastModifiedTime": "1791795114425",
+          "numRows": "1",
+          "creationTime": "1791876480400",
+          "expirationTime": "1791962880400",
+          "lastModifiedTime": "1791876482511",
           "type": "TABLE",
           "location": "EU",
-          "numTotalLogicalBytes": "0",
-          "numActiveLogicalBytes": "0",
+          "numTotalLogicalBytes": "40",
+          "numActiveLogicalBytes": "40",
           "numLongTermLogicalBytes": "0"
         }
       }

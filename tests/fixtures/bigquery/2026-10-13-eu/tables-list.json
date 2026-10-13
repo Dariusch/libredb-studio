@@ -20,8 +20,8 @@
                 "tableId": "customers"
               },
               "type": "TABLE",
-              "creationTime": "1791795114146",
-              "expirationTime": "1791881514146"
+              "creationTime": "1791876480035",
+              "expirationTime": "1791962880035"
             },
             {
               "kind": "bigquery#table",
@@ -32,8 +32,8 @@
                 "tableId": "daily_totals"
               },
               "type": "MATERIALIZED_VIEW",
-              "creationTime": "1791795117387",
-              "expirationTime": "1791881517387"
+              "creationTime": "1791876484504",
+              "expirationTime": "1791962884504"
             },
             {
               "kind": "bigquery#table",
@@ -47,8 +47,8 @@
               "view": {
                 "useLegacySql": false
               },
-              "creationTime": "1791795116981",
-              "expirationTime": "1791881516981"
+              "creationTime": "1791876484088",
+              "expirationTime": "1791962884088"
             },
             {
               "kind": "bigquery#table",
@@ -59,8 +59,8 @@
                 "tableId": "orders"
               },
               "type": "TABLE",
-              "creationTime": "1791795113815",
-              "expirationTime": "1791881513815"
+              "creationTime": "1791876479702",
+              "expirationTime": "1791962879702"
             }
           ],
           "totalItems": 4
@@ -86,8 +86,8 @@
                 "tableId": "orders_2023"
               },
               "type": "TABLE",
-              "creationTime": "1791795114425",
-              "expirationTime": "1791881514425"
+              "creationTime": "1791876480400",
+              "expirationTime": "1791962880400"
             }
           ],
           "totalItems": 1

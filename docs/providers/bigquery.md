@@ -107,7 +107,7 @@ connections:
   - id: "bq-integration"
     name: "BigQuery integration"
     type: "bigquery"
-    database: "rmt-integration"          # project id
+    database: "example-integration"      # project id
     schema: "analytics"                  # optional default dataset
     location: "EU"                       # optional; detected when absent
     password: "${BQ_INTEGRATION_SA_JSON}"
@@ -118,7 +118,7 @@ connections:
   - id: "bq-production"
     name: "BigQuery production"
     type: "bigquery"
-    database: "rmt-production"
+    database: "example-production"
     roles: ["admin"]
     managed: true
 ```
@@ -232,7 +232,8 @@ The absence is `bigquery`'s entry in `EXPECTED_EDIT_ABSTAINERS` (`tests/helpers/
 
 The monitoring panels read the region `INFORMATION_SCHEMA` views for the detected location; a failed read is not cached, so the next poll retries.
 `JOBS_BY_PROJECT` reads are cached for 60 s, because the panel polls every 30 s and every read bills the 10 MB minimum.
-`TABLE_STORAGE` reads are cached for 15 minutes: a project-wide read scans the whole view, which a dry run estimated at about 1.2 GB in a project with many datasets, while a read filtered to one dataset estimated about 100 MB.
+`TABLE_STORAGE` reads are cached for 15 minutes: a project-wide read scans the whole view, which a dry run estimated at about 1.2 GB in a project with many datasets.
+The view prunes by where `table_schema` sorts, so a read filtered to one dataset estimated between about 70 MB and the full 1.2 GB depending on its name; the recorded reads of `tests/live/bigquery-evidence.ts` billed 0 bytes.
 The overview and the storage panel share one read, grouped by dataset.
 
 | Panel           | Source                       | Notes                                                                   |

@@ -2,27 +2,34 @@
  * Records the captures tests/integration/db/bigquery-provider.test.ts replays (see tests/fixtures/bigquery/README.md):
  * labelled scratch datasets are created, recorded against over raw REST with the server's ADC, scrubbed, and dropped.
  *
- *   bun tests/live/bigquery-evidence.ts --project rmt-integration
+ *   bun tests/live/bigquery-evidence.ts --project <project id> [--refuse <name>[,<name>...]]
+ *
+ * The project id, and every --refuse name (an organisation, a domain), stops the run if a scrubbed capture still holds it.
  */
+import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { importPKCS8, SignJWT } from "jose";
 import { createNodeTransport } from "@/lib/db/http/node-transport";
 import { createTokenSource, readCredentials, tokenOrigin } from "@/lib/db/providers/sql/bigquery/auth";
 
-const ALLOWED_PROJECT = "rmt-integration";
 /** Region INFORMATION_SCHEMA keeps listing a dropped dataset's tables for a while, so names are per run. */
 const RUN = Date.now().toString(36);
-const PREFIX = `libredb_capture_${RUN}_`;
+// TABLE_STORAGE prunes by where table_schema sorts; a name sorting last sits in a small block in most projects.
+const PREFIX = `zz_libredb_capture_${RUN}_`;
 const LABEL = `libredb-capture-${RUN}`;
 const REGION = "eu";
 const MAX_BILLED_BYTES = 1024 ** 3;
 const API = "https://bigquery.googleapis.com/bigquery/v2/projects";
+const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const OUT_ROOT = path.join(import.meta.dir, "..", "fixtures", "bigquery");
 
 const args = process.argv.slice(2);
-const project = args[args.indexOf("--project") + 1];
-if (args.indexOf("--project") < 0 || project !== ALLOWED_PROJECT) {
-  console.error(`bigquery-evidence: pass --project ${ALLOWED_PROJECT}; no other project is allowed`);
+const flag = (name: string) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+const project = flag("--project") ?? "";
+const refused = (flag("--refuse") ?? "").split(",").filter(Boolean);
+if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(project)) {
+  console.error("bigquery-evidence: pass --project <project id>");
   process.exit(2);
 }
 
@@ -51,8 +58,9 @@ async function api(
   pathAndQuery: string,
   body?: Wire,
   bearer?: string,
+  inProject: string = project,
 ): Promise<{ status: number; json: Wire }> {
-  const response = await fetch(`${API}/${project}${pathAndQuery}`, {
+  const response = await fetch(`${API}/${inProject}${pathAndQuery}`, {
     method,
     headers: {
       authorization: `Bearer ${bearer ?? (await token(AbortSignal.timeout(30_000)))}`,
@@ -65,7 +73,12 @@ async function api(
   const json = (text ? JSON.parse(text) : {}) as Wire;
   if (recording) {
     captures.get(recording)!.push({
-      request: { method, path: pathAndQuery, ...(body ? { body } : {}) },
+      request: {
+        method,
+        ...(inProject === project ? {} : { project: inProject }),
+        path: pathAndQuery,
+        ...(body ? { body } : {}),
+      },
       response: { status: response.status, body: json },
     });
   }
@@ -151,6 +164,8 @@ async function setup(): Promise<void> {
         { length: 7 },
         (_, i) => `(${i + 1}, ${(i % 2) + 1}, TIMESTAMP '2026-10-0${i + 1} 10:00:00+00', ${i + 1}.50)`,
       ).join(", "),
+    // A table without data has no storage, so TABLE_STORAGE would never list `archive`.
+    `INSERT ${ds("archive")}.orders_2023 (order_id, customer_id, placed_at, total) VALUES (1, 1, TIMESTAMP '2023-06-01 10:00:00+00', 9.50)`,
     `INSERT ${ds("shop")}.customers (customer_id, name, address, tags) VALUES ` +
       "(1, 'Ada', STRUCT('Berlin', 10115), ['vip']), (2, 'Grace', STRUCT('Bonn', 53111), [])",
     `CREATE VIEW ${ds("shop")}.order_summary AS SELECT customer_id, SUM(total) AS spent FROM ${ds("shop")}.orders GROUP BY customer_id`,
@@ -263,6 +278,61 @@ async function record(): Promise<void> {
     );
     await ok("POST", `/jobs/${job}/cancel?location=EU`);
   });
+  await scenario("access-denied", async () => {
+    // A public project grants no one bigquery.jobs.create.
+    const { status, json } = await api("POST", "/queries", jobBody("SELECT 1"), undefined, "bigquery-public-data");
+    const reason = (json.error as { errors?: { reason?: string }[] } | undefined)?.errors?.[0]?.reason;
+    expect(status === 403 && reason === "accessDenied", "HTTP 403 accessDenied");
+  });
+  await scenario("token-rejected", async () => {
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      publicKeyEncoding: { type: "spki", format: "pem" },
+    });
+    const iat = Math.floor(Date.now() / 1000);
+    const assertion = await new SignJWT({ scope: "https://www.googleapis.com/auth/bigquery" })
+      .setProtectedHeader({ alg: "RS256", typ: "JWT" })
+      .setIssuer("libredb-capture@example.iam.gserviceaccount.com")
+      .setAudience(TOKEN_URL)
+      .setIssuedAt(iat)
+      .setExpirationTime(iat + 3600)
+      .sign(await importPKCS8(privateKey, "RS256"));
+    const grant = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+    const response = await fetch(TOKEN_URL, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: grant, assertion }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const body = (await response.json()) as Wire;
+    // The assertion is left out: a signed JWT reads as a secret to the scanners, and the replay signs its own.
+    captures.get("token-rejected")!.push({
+      request: { method: "POST", path: TOKEN_URL, body: { grant_type: grant } },
+      response: { status: response.status, body },
+    });
+    expect(response.status === 400 && typeof body.error === "string", "HTTP 400 with an OAuth error");
+  });
+  await scenario("storage", async () => {
+    const grouped =
+      "SELECT table_schema, COUNT(*) AS tables, SUM(total_logical_bytes) AS bytes " +
+      `FROM ${region}.TABLE_STORAGE WHERE project_id = '${project}' AND NOT deleted AND ${filtered} ` +
+      "GROUP BY table_schema ORDER BY bytes DESC";
+    // TABLE_STORAGE lags behind new tables; a read that does not show both datasets yet is dropped and retried.
+    for (let attempt = 1; ; attempt++) {
+      const rows = (await guardedQuery(grouped)).rows as unknown[] | undefined;
+      if (rows?.length === 2) break;
+      captures.get("storage")!.pop();
+      console.log(`storage: ${rows?.length ?? 0} of 2 datasets listed, attempt ${attempt}/15`);
+      if (attempt === 15) throw new Error(`TABLE_STORAGE listed ${rows?.length ?? 0} of 2 datasets after 15 minutes`);
+      await Bun.sleep(60_000);
+    }
+    await guardedQuery(
+      "SELECT table_schema, table_name, total_rows, total_logical_bytes " +
+        `FROM ${region}.TABLE_STORAGE WHERE project_id = '${project}' AND NOT deleted AND table_schema = '${ds("shop")}' ` +
+        "ORDER BY total_logical_bytes DESC LIMIT 500",
+    );
+  });
   await scenario("dml", async () => {
     const dml = await ok("POST", "/queries", jobBody(`DELETE FROM ${ds("shop")}.orders WHERE true`));
     jobOf(dml);
@@ -271,7 +341,6 @@ async function record(): Promise<void> {
   // JOBS lags a few seconds behind the jobs it lists.
   await Bun.sleep(10_000);
   const ours = ourJobs.map((id) => `'${id}'`).join(", ");
-  // No TABLE_STORAGE: a project-wide read dry-runs at ~1.2 GB here.
   await scenario("monitoring", async () => {
     await guardedQuery(
       `SELECT COUNT(*) AS total, COUNTIF(cache_hit) AS cached FROM ${region}.JOBS_BY_PROJECT ` +
@@ -327,17 +396,18 @@ function scrub(all: Map<string, Exchange[]>): Map<string, string> {
     out.set(name, text);
   }
 
+  const escape = (text: string) => new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
   const forbidden = [
-    /rmt/i,
-    /retailmedia/i,
+    escape(project),
+    ...refused.map(escape),
     /ya29\.(?!not-a-valid)/,
-    /bearer/i,
+    /bearer\s+\S/i,
     /private_key/,
     /access_token/,
     /refresh_token/,
     /\w@\w/,
   ];
-  if ("client_id" in creds) forbidden.push(new RegExp(creds.client_id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  if ("client_id" in creds) forbidden.push(escape(creds.client_id));
   for (const [name, text] of out) {
     for (const pattern of forbidden) {
       const line = text.split("\n").find((l) => pattern.test(l));

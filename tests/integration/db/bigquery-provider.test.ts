@@ -1,7 +1,7 @@
 /**
  * BigQuery provider, end to end: real provider, transport and token source; only `createNodeTransport` is faked.
- * Answers replay tests/fixtures/bigquery/2026-10-12-eu/, recorded on 2026-10-12 in region EU (see its README).
- * Built from the documented shapes instead: token endpoint answers, 403 refusals, TABLE_STORAGE reads.
+ * Answers replay tests/fixtures/bigquery/2026-10-13-eu/, recorded on 2026-10-13 in region EU (see its README).
+ * Built instead: a successful token answer (it carries a live token) and transport timeouts (no answer exists).
  * `mock.module()` is process-wide, so the runner gives this file its own process.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -31,7 +31,7 @@ interface Logged {
   authorization: string | undefined;
 }
 
-const CAPTURES = join(import.meta.dir, "..", "..", "fixtures", "bigquery", "2026-10-12-eu");
+const CAPTURES = join(import.meta.dir, "..", "..", "fixtures", "bigquery", "2026-10-13-eu");
 function captured(scenario: string, exchange = 0): Reply {
   const file = JSON.parse(readFileSync(join(CAPTURES, `${scenario}.json`), "utf8")) as {
     exchanges: { request: { path: string }; response: { status: number; body: Wire } }[];
@@ -60,16 +60,6 @@ const apiError = (status: number, message: string, reason: string): Reply => ({
   status,
   json: { error: { code: status, message, errors: [{ reason, message }] } },
 });
-const storage = (names: string[], rows: string[][]): Reply =>
-  ok({
-    jobComplete: true,
-    jobReference: { jobId: "job-meta", location: "EU" },
-    schema: { fields: names.map((name) => ({ name, type: "STRING" })) },
-    rows: rows.map((row) => ({ f: row.map((v) => ({ v })) })),
-    totalBytesProcessed: "10485760",
-    totalBytesBilled: "10485760",
-  });
-
 class FakeGoogle {
   requests: Logged[] = [];
   informationSchema = true;
@@ -151,7 +141,7 @@ class FakeGoogle {
     const own = this.onQuery(sql, body);
     if (own) return own;
     if (/INFORMATION_SCHEMA/.test(sql)) {
-      if (!this.informationSchema) return apiError(403, "Access Denied: INFORMATION_SCHEMA", "accessDenied");
+      if (!this.informationSchema) return captured("access-denied");
       return this.informationSchemaReply(sql);
     }
     if (/^\s*CREATE TABLE shop\.refunds/i.test(sql)) {
@@ -169,24 +159,8 @@ class FakeGoogle {
     if (/COUNTIF\(cache_hit\)/.test(sql)) return captured("monitoring", 0);
     if (/GROUP BY query/.test(sql)) return captured("monitoring", 1);
     if (/state != 'DONE'/.test(sql)) return captured("slow-job", 2);
-    if (/total_rows, total_logical_bytes/.test(sql)) {
-      return storage(
-        ["table_schema", "table_name", "total_rows", "total_logical_bytes"],
-        [
-          ["shop", "orders", "1200", "2097152"],
-          ["shop", "customers", "300", "1048576"],
-        ],
-      );
-    }
-    if (/GROUP BY table_schema/.test(sql)) {
-      return storage(
-        ["table_schema", "tables", "bytes"],
-        [
-          ["shop", "4", "3145728"],
-          ["archive", "1", "1024"],
-        ],
-      );
-    }
+    if (/GROUP BY table_schema/.test(sql)) return captured("storage", 0);
+    if (/total_rows, total_logical_bytes/.test(sql)) return captured("storage", 1);
     return apiError(400, `unexpected INFORMATION_SCHEMA read: ${sql}`, "invalidQuery");
   }
 }
@@ -260,7 +234,7 @@ describe("connect", () => {
   });
 
   test("a principal without datasets.list still connects, leaving the location to BigQuery", async () => {
-    google.datasetsReply = apiError(403, "Access Denied: datasets.list", "accessDenied");
+    google.datasetsReply = captured("access-denied");
     const provider = await open();
     expect(provider.isConnected()).toBe(true);
     expect(queriesWith(/^SELECT 1$/)[0].body?.location).toBeUndefined();
@@ -274,12 +248,12 @@ describe("connect", () => {
   });
 
   test("a rejected token request is an AuthenticationError and leaves the provider disconnected", async () => {
-    google.tokenReply = { status: 400, json: { error: "invalid_grant", error_description: "Invalid JWT Signature." } };
+    google.tokenReply = captured("token-rejected");
     const provider = new BigQueryProvider(connection());
     opened.push(provider);
     const failure = await provider.connect().catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(AuthenticationError);
-    expect((failure as Error).message).toContain("Invalid JWT Signature.");
+    expect((failure as Error).message).toContain("Invalid grant: account not found");
     expect(provider.isConnected()).toBe(false);
     expect(google.closed).toBeGreaterThan(0);
   });
@@ -330,7 +304,7 @@ describe("query", () => {
       paid: "BOOL",
     });
     // getQueryResults carries no billed bytes.
-    expect(result.warnings).toEqual([{ message: "Processed 0 B", severity: "info" }]);
+    expect(result.warnings).toEqual([{ message: "Processed 0 B (cache hit)", severity: "info" }]);
   });
 
   test("says when the answer came from the cache and reports DML rows as rowCount", async () => {
@@ -346,8 +320,9 @@ describe("query", () => {
     ]);
     const dml = await provider.query("DELETE FROM shop.orders WHERE true");
     expect(dml.rowCount).toBe(7);
-    // BigQuery answers a DELETE with the table's schema and no rows.
-    expect(dml.rows).toEqual([]);
+    // BigQuery answers a DELETE with the table's schema; the grid shows the count only when fields are empty.
+    expect(dml).toMatchObject({ rows: [], fields: [] });
+    expect(dml.columnTypes).toBeUndefined();
   });
 
   test("the dry-run marker sends dryRun:true and answers one bytes row without executing", async () => {
@@ -378,11 +353,7 @@ describe("query", () => {
   test("a 401 is an AuthenticationError and a 403 a QueryError", async () => {
     const provider = await open();
     google.onQuery = (sql) =>
-      sql === "SELECT unauth"
-        ? captured("auth-401")
-        : sql === "SELECT denied"
-          ? apiError(403, "Access Denied: Table demo-project:shop.orders", "accessDenied")
-          : undefined;
+      sql === "SELECT unauth" ? captured("auth-401") : sql === "SELECT denied" ? captured("access-denied") : undefined;
     await expect(provider.query("SELECT unauth")).rejects.toBeInstanceOf(AuthenticationError);
     const denied = await provider.query("SELECT denied").catch((error: unknown) => error);
     expect(denied).toBeInstanceOf(QueryError);
@@ -404,7 +375,8 @@ describe("query", () => {
     };
     const provider = await open();
     await expect(provider.query("SELECT slow")).rejects.toBeInstanceOf(TimeoutError);
-    const cancel = posted(`/jobs/${encodeURIComponent("<job-17>")}/cancel`);
+    const job = (captured("slow-job", 0).json.jobReference as { jobId: string }).jobId;
+    const cancel = posted(`/jobs/${encodeURIComponent(job)}/cancel`);
     expect(cancel).toHaveLength(1);
     expect(cancel[0].params.get("location")).toBe("EU");
   });
@@ -528,41 +500,42 @@ describe("monitoring", () => {
     const overview = await provider.getOverview();
     expect(overview).toMatchObject({
       version: "BigQuery (EU)",
-      tableCount: 5,
-      databaseSize: "3 MB",
-      databaseSizeBytes: 3146752,
+      tableCount: 4,
+      databaseSize: "551 B",
+      databaseSizeBytes: 551,
       indexCount: 0,
     });
-    expect(await provider.getPerformanceMetrics()).toEqual({ cacheHitRatio: 10.5, queriesPerSecond: 0.01 });
+    expect(await provider.getPerformanceMetrics()).toEqual({ cacheHitRatio: 15, queriesPerSecond: 0.01 });
     const slow = await provider.getSlowQueries({ limit: 5 });
     expect(slow).toHaveLength(5);
     expect(slow[1]).toEqual({
       query: "DELETE FROM shop.orders WHERE true",
       calls: 1,
-      totalTime: 910,
-      avgTime: 910,
-      minTime: 910,
-      maxTime: 910,
+      totalTime: 885,
+      avgTime: 885,
+      minTime: 885,
+      maxTime: 885,
       rows: 0,
     });
     const sessions = await provider.getActiveSessions();
     expect(sessions).toHaveLength(1);
     expect(sessions[0]).toMatchObject({
-      pid: "<job-17>",
+      pid: (captured("slow-job", 0).json.jobReference as { jobId: string }).jobId,
       user: "<user-1>",
       database: "demo-project",
       state: "running",
-      duration: "6s",
-      durationMs: 6127,
+      duration: "8s",
+      durationMs: 8090,
     });
-    expect(sessions[0].queryStart).toEqual(new Date(1791795124874));
+    expect(sessions[0].queryStart).toEqual(new Date(1791876491557));
     expect(await provider.getTableStats({ schema: "shop" })).toEqual([
-      { schemaName: "shop", tableName: "orders", rowCount: 1200, totalSize: "2 MB", totalSizeBytes: 2097152 },
-      { schemaName: "shop", tableName: "customers", rowCount: 300, totalSize: "1 MB", totalSizeBytes: 1048576 },
+      { schemaName: "shop", tableName: "orders", rowCount: 7, totalSize: "280 B", totalSizeBytes: 280 },
+      { schemaName: "shop", tableName: "daily_totals", rowCount: 7, totalSize: "168 B", totalSizeBytes: 168 },
+      { schemaName: "shop", tableName: "customers", rowCount: 2, totalSize: "63 B", totalSizeBytes: 63 },
     ]);
     expect(await provider.getStorageStats()).toEqual([
-      { name: "shop", location: "EU", size: "3 MB", sizeBytes: 3145728 },
-      { name: "archive", location: "EU", size: "1 KB", sizeBytes: 1024 },
+      { name: "shop", location: "EU", size: "511 B", sizeBytes: 511 },
+      { name: "archive", location: "EU", size: "40 B", sizeBytes: 40 },
     ]);
     expect(await provider.getIndexStats()).toEqual([]);
     expect((await provider.getHealth()).slowQueries).toEqual([]);

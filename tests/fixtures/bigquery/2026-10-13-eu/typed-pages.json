@@ -69,7 +69,7 @@
           },
           "jobReference": {
             "projectId": "demo-project",
-            "jobId": "<job-14>",
+            "jobId": "<job-15>",
             "location": "EU"
           },
           "totalRows": "3",
@@ -147,17 +147,16 @@
           ],
           "totalBytesProcessed": "0",
           "jobComplete": true,
-          "cacheHit": false,
-          "queryId": "<job-14>",
+          "cacheHit": true,
+          "queryId": "<job-15>",
           "jobCreationReason": {
             "code": "REQUESTED"
           },
           "totalBytesBilled": "0",
-          "totalSlotMs": "53",
           "location": "EU",
-          "creationTime": "1791795123428",
-          "startTime": "1791795123442",
-          "endTime": "1791795123633",
+          "creationTime": "1791876490128",
+          "startTime": "1791876490146",
+          "endTime": "1791876490237",
           "pageRowCount": "2",
           "statementType": "SELECT"
         }
@@ -166,7 +165,7 @@
     {
       "request": {
         "method": "GET",
-        "path": "/queries/<job-14>?maxResults=2&location=EU&formatOptions.useInt64Timestamp=true"
+        "path": "/queries/<job-15>?maxResults=2&location=EU&formatOptions.useInt64Timestamp=true"
       },
       "response": {
         "status": 200,
@@ -220,7 +219,7 @@
           },
           "jobReference": {
             "projectId": "demo-project",
-            "jobId": "<job-14>",
+            "jobId": "<job-15>",
             "location": "EU"
           },
           "totalRows": "3",
@@ -298,14 +297,14 @@
           ],
           "totalBytesProcessed": "0",
           "jobComplete": true,
-          "cacheHit": false
+          "cacheHit": true
         }
       }
     },
     {
       "request": {
         "method": "GET",
-        "path": "/queries/<job-14>?maxResults=2&location=EU&formatOptions.useInt64Timestamp=true&pageToken=<page-1>"
+        "path": "/queries/<job-15>?maxResults=2&location=EU&formatOptions.useInt64Timestamp=true&pageToken=<page-1>"
       },
       "response": {
         "status": 200,
@@ -359,7 +358,7 @@
           },
           "jobReference": {
             "projectId": "demo-project",
-            "jobId": "<job-14>",
+            "jobId": "<job-15>",
             "location": "EU"
           },
           "totalRows": "3",
@@ -402,7 +401,7 @@
           ],
           "totalBytesProcessed": "0",
           "jobComplete": true,
-          "cacheHit": false
+          "cacheHit": true
         }
       }
     }

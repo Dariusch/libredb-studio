@@ -1,20 +1,21 @@
 {
-  "scenario": "select-1",
+  "scenario": "dry-run",
   "exchanges": [
     {
       "request": {
         "method": "POST",
         "path": "/queries",
         "body": {
-          "query": "SELECT 1",
+          "query": "SELECT * FROM shop.orders",
           "location": "EU",
           "useLegacySql": false,
-          "maxResults": 1,
+          "maxResults": 1000,
           "timeoutMs": 60000,
           "jobTimeoutMs": "120000",
           "formatOptions": {
             "useInt64Timestamp": true
-          }
+          },
+          "dryRun": true
         }
       },
       "response": {
@@ -24,40 +25,38 @@
           "schema": {
             "fields": [
               {
-                "name": "f0_",
+                "name": "order_id",
                 "type": "INTEGER",
+                "mode": "NULLABLE"
+              },
+              {
+                "name": "customer_id",
+                "type": "INTEGER",
+                "mode": "NULLABLE"
+              },
+              {
+                "name": "placed_at",
+                "type": "TIMESTAMP",
+                "mode": "NULLABLE"
+              },
+              {
+                "name": "total",
+                "type": "NUMERIC",
                 "mode": "NULLABLE"
               }
             ]
           },
           "jobReference": {
             "projectId": "demo-project",
-            "jobId": "<job-8>",
             "location": "EU"
           },
-          "totalRows": "1",
-          "rows": [
-            {
-              "f": [
-                {
-                  "v": "1"
-                }
-              ]
-            }
-          ],
-          "totalBytesProcessed": "0",
+          "totalBytesProcessed": "280",
           "jobComplete": true,
-          "cacheHit": true,
-          "queryId": "<job-8>",
-          "jobCreationReason": {
-            "code": "REQUESTED"
-          },
+          "cacheHit": false,
           "totalBytesBilled": "0",
           "location": "EU",
-          "creationTime": "1791795117993",
-          "startTime": "1791795118000",
-          "endTime": "1791795118049",
-          "pageRowCount": "1",
+          "creationTime": "1791876488119",
+          "endTime": "1791876488291",
           "statementType": "SELECT"
         }
       }
